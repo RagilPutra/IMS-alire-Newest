@@ -4749,14 +4749,22 @@ function renderStokOpname(){
   // berkurang/terpakai. Purely a display-time flip -- the stored value and
   // its formula never change, so past finalized periods read correctly too.
   const totalSelisihSoFar = -Object.values(locationUsedValues).reduce((s,v)=>s+v,0);
+  // Total sementara: lokasi yang sudah Selesai (nilai terkunci) + estimasi dari draft/Hampir Final/revisi yang belum dikunci. Draft revisi menggantikan nilai terkunci lokasi itu.
+  let liveTotal = 0, liveSelisih = 0, liveDraftCount = 0;
+  WAREHOUSES.forEach(w=>{
+    const reopenedW = !!(session && session.reopened && session.reopened[w.id]);
+    const d = (!locationsDone[w.id] || reopenedW) ? findOpnameDraft(w.id, periodKey) : null;
+    if(d && Object.keys(d.counts||{}).length){ const e = opnameDraftValues(w.id, d); liveTotal += e.total; liveSelisih += e.selisih; liveDraftCount++; }
+    else if(locationsDone[w.id]){ liveTotal += locationValues[w.id]||0; liveSelisih += -(locationUsedValues[w.id]||0); }
+  });
   const history = state.opnameSessions.filter(s=>s.status==='selesai').sort((a,b)=>a.periodKey.localeCompare(b.periodKey));
   const isPastPeriod = periodKey !== currentPeriodKey();
 
   document.getElementById('content').innerHTML = `
     ${!canOpname ? `<div class="lock-note" style="margin-bottom:14px;">Hanya Receiving dan Master User yang dapat melakukan Stok Opname.</div>` : ''}
     <div class="panel">
-      <div class="panel-head"><h3>Opname Berjalan</h3><span class="panel-total" style="display:flex; align-items:center; gap:10px;">Total sejauh ini: <b>${fmtIDR(totalValueSoFar)}</b>${reportDownloadBtns(!!session, `generateOpnamePdf('${periodKey}')`, `generateOpnameExcel('${periodKey}')`)}</span></div>
-      ${!allDone ? `<div class="cell-sub" style="padding:8px 16px 0;">Lokasi yang berstatus "Belum" belum ikut dijumlahkan ke total ini — total baru mencakup lokasi yang sudah "Selesai".</div>` : ''}
+      <div class="panel-head"><h3>Opname Berjalan</h3><span class="panel-total" style="display:flex; align-items:center; gap:10px;">${liveDraftCount>0 ? `Total sementara: <b>${fmtIDR(Math.round(liveTotal))}</b> <span class="tag tag-gold" style="font-size:10px;" title="Termasuk estimasi dari draft yang belum dikunci">sementara</span>` : `Total sejauh ini: <b>${fmtIDR(totalValueSoFar)}</b>`}${reportDownloadBtns(!!session, `generateOpnamePdf('${periodKey}')`, `generateOpnameExcel('${periodKey}')`)}</span></div>
+      ${liveDraftCount>0 ? `<div class="cell-sub" style="padding:8px 16px 0;">Total <b>sementara</b>: lokasi "Selesai" (nilai terkunci) + estimasi ${liveDraftCount} lokasi yang masih Draft/Hampir Final/revisi (berubah mengikuti angka draft, belum final sampai dikunci). Selisih Nilai sementara: <b style="color:${Math.round(liveSelisih)>0 ? 'var(--success)' : (Math.round(liveSelisih)<0 ? 'var(--danger)' : 'inherit')};">${fmtIDR(Math.round(liveSelisih))}</b>. Total terkunci saja: ${fmtIDR(totalValueSoFar)}. Lokasi "Belum" tanpa draft belum ikut dijumlahkan.</div>` : (!allDone ? `<div class="cell-sub" style="padding:8px 16px 0;">Lokasi yang berstatus "Belum" belum ikut dijumlahkan ke total ini — total baru mencakup lokasi yang sudah "Selesai".</div>` : '')}
       <div class="panel-body" style="padding:12px 16px;">
         <div style="display:flex; align-items:flex-end; gap:20px; flex-wrap:wrap;">
           <div class="field" style="margin:0; max-width:280px; flex:1; min-width:200px;">
