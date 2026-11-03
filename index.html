@@ -1123,6 +1123,11 @@ tbody tr.clickable:hover td{background:var(--brand-tint);}
 .filter-row select, .field select:not([multiple]){appearance:none; -webkit-appearance:none; -moz-appearance:none; padding-right:28px;
   background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'%3E%3Cpath d='M0 0h10L5 6z' fill='%23A19A8F'/%3E%3C/svg%3E");
   background-repeat:no-repeat; background-position:right 11px center; background-size:8px 5px; cursor:pointer;}
+/* count/qty inputs inside tables (Hitung Fisik, Koreksi): explicit light styling so a browser/OS forced-dark mode can't turn them black */
+:root{color-scheme:light;}
+.table-scroll td input[type=text], .table-scroll td input[type=number]{background-color:#fff !important; color:#2B2118 !important; -webkit-text-fill-color:#2B2118; caret-color:#2B2118; border:1px solid var(--border-strong); border-radius:8px; padding:7px 10px; min-height:34px; font:inherit; font-weight:600; color-scheme:light;}
+.table-scroll td input[type=text]:focus, .table-scroll td input[type=number]:focus{border-color:var(--caramel); box-shadow:0 0 0 3px rgba(210,164,92,.25); outline:none;}
+.table-scroll td input[disabled]{background-color:#F3EEE6 !important; opacity:.8; cursor:not-allowed;}
 /* sortable column headers */
 th.sortable{cursor:pointer; user-select:none; white-space:nowrap;}
 th.sortable:hover{color:var(--brand);}
@@ -3716,7 +3721,7 @@ function renderShell(){
     stockopname:['Stok Opname','Revisi stok fisik & bandingkan dengan penjualan'],
     'activity-log':['Aktivitas Terbaru','Seluruh riwayat pergerakan barang'],
     'opname-count':['Hitung Fisik','Masukkan jumlah fisik hasil hitung'],
-    'opname-correct':['Koreksi Opname Terkunci','Khusus Master — mengoreksi data opname yang sudah final'],
+    'opname-correct':['Koreksi Opname Terkunci','Revisi hasil hitung fisik yang sudah final'],
     storerequests:['Permintaan Barang','Permintaan dari divisi ke Gudang Utama'],
     wiprequests:['Permintaan WIP','Serah-terima WIP antar divisi kitchen — tidak memengaruhi stok/inventory maupun Stok Opname'],
     receiving:['Penerimaan Barang','Barang masuk dari supplier'],
@@ -4733,7 +4738,8 @@ function renderStokOpname(){
   const locationUsedValues = (session && session.locationUsedValues) || {};
   const locationAddedGoodsValues = (session && session.locationAddedGoodsValues) || {};
   const locationAddedWipValues = (session && session.locationAddedWipValues) || {};
-  const allDone = WAREHOUSES.every(w=>locationsDone[w.id]);
+  const anyReopened = !!(session && session.reopened && Object.keys(session.reopened).length);
+  const allDone = WAREHOUSES.every(w=>locationsDone[w.id]) && !anyReopened;
   const totalValueSoFar = Object.values(locationValues).reduce((s,v)=>s+v,0);
   // Stored per-location as (Nilai Sistem - Nilai Fisik) -- see
   // actionSubmitOpnameCount -- so negative means the physical count came in
@@ -4782,7 +4788,9 @@ function renderStokOpname(){
               // Flip to "Selisih Nilai" -- see totalSelisihSoFar above for why.
               const selisihVal = locationUsedValues[w.id]!=null ? -locationUsedValues[w.id] : null;
               const selisihColor = !selisihVal ? 'var(--text-faint)' : (selisihVal>0 ? 'var(--success)' : 'var(--danger)');
-              const draft = !done ? findOpnameDraft(w.id, periodKey) : null;
+              const reopenInfo = done ? ((session && session.reopened && session.reopened[w.id]) || null) : null;
+              const lockedFinal = done && !reopenInfo;
+              const draft = (!done || reopenInfo) ? findOpnameDraft(w.id, periodKey) : null;
               // Draft -> Checked ("Hampir Final") -> Selesai (locked). Checked
               // just means the counter has reviewed it as ready -- stock is
               // NOT adjusted until the lock icon is clicked and confirmed;
@@ -4790,14 +4798,16 @@ function renderStokOpname(){
               // so a stale review can't be locked by mistake. Distinct tag
               // colors so "Draft" and "Belum" don't read as the same thing.
               const checked = !!(draft && draft.checked);
-              const statusTag = done ? '<span class="tag tag-approved">Selesai</span>'
-                : checked ? `<span class="tag tag-gold">Hampir Final</span><div class="cell-sub">ditandai ${fmtTime(draft.checkedAt||draft.updatedAt)}</div>`
-                : draft ? `<span class="tag tag-neutral">Draft</span><div class="cell-sub">tersimpan ${fmtTime(draft.updatedAt)}</div>`
+              const revNote = reopenInfo ? `<div class="cell-sub">revisi · dibuka ${fmtTime(reopenInfo.at)}${reopenInfo.by ? ' oleh ' + escapeHtml(reopenInfo.by) : ''}</div>` : '';
+              const statusTag = lockedFinal ? '<span class="tag tag-approved">Selesai</span>'
+                : checked ? `<span class="tag tag-gold">Hampir Final</span><div class="cell-sub">ditandai ${fmtTime(draft.checkedAt||draft.updatedAt)}</div>${revNote}`
+                : draft ? `<span class="tag tag-neutral">Draft</span><div class="cell-sub">tersimpan ${fmtTime(draft.updatedAt)}</div>${revNote}`
+                : reopenInfo ? `<span class="tag tag-gold">Dibuka</span>${revNote}`
                 : '<span class="tag tag-pending">Belum</span>';
               let actionsHtml;
               if(!canOpname){
                 actionsHtml = '';
-              } else if(done){
+              } else if(lockedFinal){
                 // Locked -- this is now treated as a finalized financial
                 // record and can no longer be redone from here. The one
                 // exception: Master User can open a dedicated correction
@@ -4806,18 +4816,23 @@ function renderStokOpname(){
                 // against today's live stock -- see openOpnameCorrection().
                 actionsHtml = `<div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
                   <span class="cell-sub" style="display:inline-flex; align-items:center; gap:5px;">${ICONS.lock} Terkunci</span>
-                  ${isMaster ? `<button class="btn btn-sm btn-outline" onclick="openOpnameCorrection('${w.id}','${periodKey}')">Edit (Master)</button>` : ''}
+                  ${isMaster ? `<button class="btn btn-sm btn-outline" onclick="openOpnameCorrection('${w.id}','${periodKey}')">Edit (Master)</button><button class="btn btn-sm btn-outline" onclick="confirmReopenOpname('${w.id}','${periodKey}')">Buka Kunci</button>` : ''}
                 </div>`;
               } else if(checked){
                 actionsHtml = `<div style="display:flex; gap:6px;">
                   <button class="btn btn-sm btn-outline" onclick="openOpnameCounting('${w.id}')">Edit Opname</button>
                   <button class="icon-btn" title="Kunci hasil opname ${escapeHtml(w.name)} -- final, stok disesuaikan, tidak bisa diubah lagi" onclick="confirmLockOpname('${w.id}','${periodKey}')">${ICONS.lock}</button>
+                  ${(reopenInfo && isMaster) ? `<button class="btn btn-sm btn-outline" onclick="confirmCloseOpnameReopen('${w.id}','${periodKey}')">Batal Buka Kunci</button>` : ''}
                 </div>`;
               } else if(draft){
                 actionsHtml = `<div style="display:flex; gap:6px;">
                   <button class="btn btn-sm btn-outline" onclick="openOpnameCounting('${w.id}')">Lanjutkan Opname</button>
                   <button class="icon-btn" title="Tandai hampir final -- stok belum disesuaikan, masih bisa diedit" onclick="markOpnameDraftChecked('${w.id}','${periodKey}')">${ICONS.check}</button>
+                  ${(reopenInfo && isMaster) ? `<button class="btn btn-sm btn-outline" onclick="confirmCloseOpnameReopen('${w.id}','${periodKey}')">Batal Buka Kunci</button>` : ''}
                 </div>`;
+              } else if(reopenInfo){
+                setTimeout(()=>ensureRevisionDraft(w.id, periodKey), 0);
+                actionsHtml = `<div class="cell-sub">Menyiapkan revisi…</div><button class="btn btn-sm btn-outline" onclick="ensureRevisionDraft('${w.id}','${periodKey}',true)">Coba Lagi</button>${isMaster ? ` <button class="btn btn-sm btn-outline" onclick="confirmCloseOpnameReopen('${w.id}','${periodKey}')">Batal Buka Kunci</button>` : ''}`;
               } else {
                 actionsHtml = `<button class="btn btn-sm btn-outline" onclick="openOpnameCounting('${w.id}')">Mulai Opname</button>`;
               }
@@ -4848,7 +4863,7 @@ function renderStokOpname(){
         ${session && session.status==='selesai' ?
           `<div class="lock-note" style="margin-top:12px;">Periode ini sudah difinalisasi pada ${fmtDate(session.finalizedAt)}. % Stok terhadap Sales: <b>${session.netSales ? (session.totalValue/session.netSales*100).toFixed(2).replace('.',',') : '—'}%</b></div>` :
           `<button class="btn btn-primary" style="margin-top:12px;" onclick="submitFinalizeOpname('${periodKey}')" ${!allDone?'disabled title="Selesaikan opname di semua lokasi dulu"':''}>Selesaikan Periode Ini</button>
-           ${!allDone?'<div class="cell-sub" style="margin-top:6px;">Selesaikan opname di semua lokasi dulu sebelum finalisasi.</div>':''}`}
+           ${!allDone?`<div class="cell-sub" style="margin-top:6px;">${anyReopened ? 'Ada lokasi yang kunci opnamenya sedang dibuka untuk revisi — kunci ulang atau batalkan dulu sebelum finalisasi.' : 'Selesaikan opname di semua lokasi dulu sebelum finalisasi.'}</div>`:''}`}
       </div>
     </div>` : ''}
 
@@ -4952,6 +4967,8 @@ let opnameTouched = {};
 function opnameDraftDocId(locationId, periodKey){ return locationId + '__' + periodKey; }
 function findOpnameDraft(locationId, periodKey){ return state.opnameDrafts.find(d=>d.locationId===locationId && d.periodKey===periodKey) || null; }
 let opnameDraftSaveTimer = null;
+// Set while the counting page is a REVISION of an already-locked location (Master pressed Buka Kunci): {base:{itemId:{s,p,pr}}, lockedAdded:[ids], reopenedAt, reopenedBy}. null = normal count.
+let opnameRevisionMeta = null;
 function scheduleOpnameDraftSave(){
   if(opnameDraftSaveTimer) clearTimeout(opnameDraftSaveTimer);
   opnameDraftSaveTimer = setTimeout(()=>{ opnameDraftSaveTimer = null; saveOpnameDraftNow(true); }, 1500);
@@ -4970,6 +4987,7 @@ async function saveOpnameDraftNow(silent){
       addedPeruntukan: {...opnameAddedPeruntukan}, addedPrice: {...opnameAddedPrice},
       checked: false, checkedAt: null,
       updatedAt: nowIso,
+      ...(opnameRevisionMeta ? { revision: true, base: opnameRevisionMeta.base, lockedAdded: opnameRevisionMeta.lockedAdded||[], reopenedAt: opnameRevisionMeta.reopenedAt||null, reopenedBy: opnameRevisionMeta.reopenedBy||null } : {}),
     });
     const el = document.getElementById('opnameDraftStatus');
     if(el) el.textContent = 'Draft tersimpan · ' + fmtTime(nowIso);
@@ -5001,6 +5019,16 @@ async function markOpnameDraftChecked(locationId, periodKey){
   }
 }
 function confirmLockOpname(locationId, periodKey){
+  const dr = findOpnameDraft(locationId, periodKey);
+  if(dr && dr.revision){
+    openConfirm(
+      'Kunci Ulang Hasil Opname',
+      'Hasil revisi opname ' + whName(locationId) + ' — ' + periodLabel(periodKey) + ' akan disimpan dan lokasi ini terkunci lagi. Stok sistem hanya disesuaikan sebesar SELISIH angka lama dan angka baru (transaksi lain sejak opname dulu tidak ikut tertimpa). Lanjutkan?',
+      ()=>lockOpnameLocation(locationId, periodKey),
+      'Kunci Ulang', true
+    );
+    return;
+  }
   openConfirm(
     'Kunci Hasil Opname',
     'Mengunci hasil opname ' + whName(locationId) + ' akan menyesuaikan stok sistem sesuai hasil hitung fisik ini dan menjadikannya data final untuk lokasi & periode ini. Setelah dikunci, hasil ini tidak bisa diubah atau diulang lagi. Lanjutkan?',
@@ -5011,6 +5039,11 @@ function confirmLockOpname(locationId, periodKey){
 async function lockOpnameLocation(locationId, periodKey){
   const draft = findOpnameDraft(locationId, periodKey);
   if(!draft){ toast('Draft opname tidak ditemukan.', true); return; }
+  if(draft.revision){
+    const okRev = await lockOpnameRevision(locationId, periodKey, draft);
+    if(okRev) await deleteOpnameDraft(locationId, periodKey);
+    return;
+  }
   const ok = await actionSubmitOpnameCount(locationId, {...draft.counts}, periodKey, {...(draft.added||{})}, {...(draft.addedPeruntukan||{})}, {...(draft.addedPrice||{})});
   if(ok) await deleteOpnameDraft(locationId, periodKey);
 }
@@ -5025,7 +5058,9 @@ function openOpnameCounting(locationId){
   if(!canManageGudang(currentRole())){ toast('Peran ini tidak dapat melakukan Stok Opname.', true); return; }
   const periodKeyGuard = state.opnamePeriod || currentPeriodKey();
   const sessionGuard = state.opnameSessions.find(s=>s.periodKey===periodKeyGuard);
-  if(sessionGuard && sessionGuard.locationsDone && sessionGuard.locationsDone[locationId]){
+  const draftGuard = findOpnameDraft(locationId, periodKeyGuard);
+  const isRevisionOpen = !!(draftGuard && draftGuard.revision && opnameReopenInfo(periodKeyGuard, locationId));
+  if(sessionGuard && sessionGuard.locationsDone && sessionGuard.locationsDone[locationId] && !isRevisionOpen){
     toast('Opname ' + whName(locationId) + ' sudah terkunci sebagai data final, tidak bisa diulang.', true);
     return;
   }
@@ -5035,12 +5070,15 @@ function openOpnameCounting(locationId){
   opnameTouched = {};
   opnameAddedPeruntukan = {};
   opnameAddedPrice = {};
-  state.items.forEach(item=>{
+  opnameRevisionMeta = isRevisionOpen ? { base: {...(draftGuard.base||{})}, lockedAdded: [...(draftGuard.lockedAdded||[])], reopenedAt: draftGuard.reopenedAt||null, reopenedBy: draftGuard.reopenedBy||null } : null;
+  // A revision starts from the locked numbers only (kept in the draft), NOT
+  // from today's live stock -- see lockOpnameRevision().
+  if(!isRevisionOpen) state.items.forEach(item=>{
     const qty = stockQty(locationId, item.id);
     if(qty > 0) opnameCounts[item.id] = srHasSmallUnit(item) ? qty * item.conversionQty : qty;
   });
   const periodKey = state.opnamePeriod || currentPeriodKey();
-  const draft = findOpnameDraft(locationId, periodKey);
+  const draft = draftGuard;
   if(draft){
     // Overlay the saved draft on top of the live-stock baseline above --
     // items the counter never got to still fall back to current system
@@ -5050,7 +5088,7 @@ function openOpnameCounting(locationId){
     opnameAdded = {...(draft.added || {})};
     opnameAddedPeruntukan = {...(draft.addedPeruntukan || {})};
     opnameAddedPrice = {...(draft.addedPrice || {})};
-    toast('Draft opname ' + whName(locationId) + ' dilanjutkan (tersimpan terakhir ' + fmtTime(draft.updatedAt) + ').');
+    toast(isRevisionOpen ? 'Revisi opname ' + whName(locationId) + ' dibuka — angka sebelumnya sudah terisi.' : 'Draft opname ' + whName(locationId) + ' dilanjutkan (tersimpan terakhir ' + fmtTime(draft.updatedAt) + ').');
   }
   state.opnameSearch = ''; state.opnamePage = 1; state.opnamePeruntukan = ''; state.opnameSort = 'name_asc';
   goto('opname-count');
@@ -5066,6 +5104,12 @@ function resetOpnameFilters(){ state.opnameSearch=''; state.opnamePeruntukan='';
    explains instead of silently being in a different unit. */
 function opnameDisplayQty(item, canonicalQty){ return srHasSmallUnit(item) ? canonicalQty * item.conversionQty : canonicalQty; }
 function opnameSystemDisplay(locationId, item){
+  if(opnameRevisionMeta){
+    // Revisi: "Stok Sistem" = angka sistem yang dulu tercatat saat opname ini dikunci, bukan stok live.
+    const b = opnameRevisionMeta.base[item.id];
+    const sys = b ? (b.s||0) : 0;
+    return srHasSmallUnit(item) ? sys * item.conversionQty : sys;
+  }
   const system = stockQty(locationId, item.id);
   return srHasSmallUnit(item) ? system * item.conversionQty : system;
 }
@@ -5094,7 +5138,9 @@ function opnameUpdateTotals(){
     const canonicalQty = useSmall ? (opnameCounts[itemId] / item.conversionQty) : opnameCounts[itemId];
     const addedType = opnameAdded[itemId];
     const priceOverride = (addedType && opnameAddedPrice[itemId]!=null) ? opnameAddedPrice[itemId] : null;
-    const value = priceOverride!=null ? priceOverride : canonicalQty * (item.lastPrice||0);
+    const revBase = opnameRevisionMeta && opnameRevisionMeta.base[itemId];
+    const unitPrice = (revBase && revBase.pr!=null) ? revBase.pr : (item.lastPrice||0);
+    const value = priceOverride!=null ? priceOverride : canonicalQty * unitPrice;
     // Nilai Tercatat (totalValue) sekarang menggabungkan nilai Tambahan/WIP
     // juga -- lihat actionSubmitOpnameCount -- addedGoodsValue/addedWipValue
     // di bawah cuma rincian informasi dari total itu, bukan di luar total.
@@ -5156,6 +5202,7 @@ function renderOpnameCounting(){
     <div class="action-row"><button class="btn btn-outline" onclick="backToOpnameList()">${ICONS.arrowleft} Kembali ke Stok Opname</button></div>
     <div class="panel">
       <div class="panel-head"><h3>Hitung Fisik — ${w.name} <span style="font-weight:600; color:var(--text-secondary); font-size:12px;">(${periodLabel(state.opnamePeriod || currentPeriodKey())})</span></h3><span class="panel-total" id="opnameTotalHint"></span></div>
+      ${opnameRevisionMeta ? `<div class="lock-note" style="margin:8px 16px 0; border-radius:6px; background:var(--warning-tint); color:var(--warning); border:1px solid var(--warning);"><b>Revisi opname</b> — Master membuka kunci lokasi ini${opnameRevisionMeta.reopenedAt ? ' (' + fmtDate(opnameRevisionMeta.reopenedAt) + (opnameRevisionMeta.reopenedBy ? ', oleh ' + escapeHtml(opnameRevisionMeta.reopenedBy) : '') + ')' : ''}. Angka yang kamu masukkan sebelumnya sudah terisi; "Stok Sistem" adalah angka sistem saat opname dulu. Ubah yang salah, lalu dari menu Stok Opname tandai hampir final dan kunci lagi dengan ikon gembok. Stok hanya disesuaikan sebesar selisih angka lama dan baru.</div>` : ''}
       <div class="cell-sub" style="padding:8px 16px 0;" id="opnameDraftStatus">${draftStatusInitial}</div>
       <div class="lock-note" style="margin:8px 16px 0; border-radius:6px;">Progres hitung di halaman ini otomatis tersimpan sebagai draft. Boleh ditinggal kapan saja (mis. lanjut ke menu lain) — nanti tinggal buka lagi "Lanjutkan Opname" untuk ${w.name} dari menu Stok Opname untuk melanjutkan dari posisi terakhir.</div>
       <div class="filter-row">
@@ -5202,7 +5249,7 @@ function renderOpnameCounting(){
                   ${isStorage?`<td>${peruntukanLabel}</td>`:''}
                   <td>${escapeHtml(countUnit||'')}${useSmall ? `<div class="cell-sub">1 ${escapeHtml(item.uom)} = ${fmtNum(item.conversionQty)} ${escapeHtml(item.smallUnit)}</div>` : ''}</td>
                   <td class="num">${fmtNum(systemDisplay)}</td>
-                  <td class="num"><input type="text" inputmode="decimal" style="width:96px; text-align:right;" value="${touched ? fmtQtyInputValue(counted) : ''}" placeholder="0" oninput="formatQtyInput(this); opnameUpdateCount('${item.id}', this.value)"></td>
+                  <td class="num"><input type="text" inputmode="decimal" style="width:96px; text-align:right;" value="${touched ? fmtQtyInputValue(counted) : ''}" placeholder="0" ${(opnameRevisionMeta && opnameRevisionMeta.lockedAdded.includes(item.id)) ? 'disabled title="Barang Tambahan/WIP yang sudah tercatat tidak bisa direvisi di sini"' : ''} oninput="formatQtyInput(this); opnameUpdateCount('${item.id}', this.value)"></td>
                   <td class="num" id="opnameDiff-${item.id}" style="color:${diffColor}; font-weight:700;">${diff===0?'—':(diff>0?'+':'')+fmtNum(diff)}</td>
                 </tr>`;
               }).join('')}
@@ -5261,9 +5308,164 @@ let opnameCorrectNewItems = [];
 // returns null for every other location, so that button simply never renders
 // anywhere else.
 const OPNAME_CORRECT_ADD_LOCATIONS = WAREHOUSES.map(w=>w.id);
+/* Buka Akses: Master bisa membuka kembali satu lokasi opname yang sudah
+   Selesai supaya Receiving ikut merevisi angkanya (salah input), lalu
+   Receiving menyimpannya -- itu otomatis mengunci ulang. Pakai jalur koreksi
+   yang sama dengan "Edit (Master)" (stok hanya disesuaikan sebesar selisih,
+   bukan dihitung ulang terhadap stok live), jadi transaksi yang terjadi
+   setelah dikunci tidak ikut ketimpa. Penanda akses ada di
+   opnameSessions/{periode}.reopened[lokasi] = {at, by}. */
+function opnameReopenInfo(periodKey, locationId){
+  const s = state.opnameSessions.find(x=>x.periodKey===periodKey);
+  return (s && s.reopened && s.reopened[locationId]) || null;
+}
+function canCorrectOpname(role, periodKey, locationId){
+  return role.kind==='master'; // Receiving merevisi lewat halaman Hitung Fisik biasa (lihat setOpnameReopen), bukan halaman koreksi ini.
+}
+function confirmReopenOpname(locationId, periodKey){
+  if(currentRole().kind!=='master'){ toast('Hanya Master User yang dapat membuka kunci opname.', true); return; }
+  const session = state.opnameSessions.find(x=>x.periodKey===periodKey);
+  const finalized = session && session.status==='selesai';
+  openConfirm(
+    'Buka Kunci Opname',
+    'Opname ' + whName(locationId) + ' — ' + periodLabel(periodKey) + ' kembali ke status "Hampir Final" dengan angka yang sudah dimasukkan sebelumnya. Receiving bisa mengubahnya lewat Hitung Fisik biasa, lalu mengunci lagi dengan ikon gembok. Stok hanya disesuaikan sebesar selisih angka lama dan baru saat dikunci ulang.' + (finalized ? ' Periode ini sudah difinalisasi; laporan ikut diperbarui otomatis setelah dikunci ulang.' : ' Selama ada lokasi yang dibuka, periode ini belum bisa diselesaikan.'),
+    ()=>setOpnameReopen(locationId, periodKey, true),
+    'Buka Kunci', false
+  );
+}
+function confirmCloseOpnameReopen(locationId, periodKey){
+  if(currentRole().kind!=='master'){ toast('Hanya Master User yang dapat membatalkan buka kunci.', true); return; }
+  openConfirm(
+    'Batal Buka Kunci',
+    'Lokasi ' + whName(locationId) + ' — ' + periodLabel(periodKey) + ' dikunci kembali seperti semula, dengan angka terkunci yang lama. Perubahan yang belum dikunci ulang oleh Receiving dibuang, stok tidak berubah. Pakai ini kalau jadi tidak perlu direvisi. Lanjutkan?',
+    ()=>setOpnameReopen(locationId, periodKey, false),
+    'Kunci Kembali', true
+  );
+}
+function round6(v){ return Math.round((v||0) * 1e6) / 1e6; }
+// Draft "Hampir Final" bertanda revision, dibangun dari angka yang terkunci (counts dalam satuan hitung, sama seperti draft biasa).
+function buildRevisionDraft(detail, locationId, periodKey, by, nowIso){
+  const counts = {}, touched = {}, added = {}, addedPeruntukan = {}, addedPrice = {}, base = {}, lockedAdded = [];
+  (detail.items||[]).forEach(it=>{
+    const item = itemById(it.itemId);
+    counts[it.itemId] = round6(item ? opnameDisplayQty(item, it.physicalQty||0) : (it.physicalQty||0));
+    touched[it.itemId] = true;
+    base[it.itemId] = { s: it.addedType ? 0 : (it.systemQty||0), p: it.physicalQty||0, pr: it.price||0 };
+    if(it.addedType){
+      added[it.itemId] = it.addedType;
+      if(it.addedPeruntukan) addedPeruntukan[it.itemId] = it.addedPeruntukan;
+      addedPrice[it.itemId] = it.nilaiFisik||0;
+      lockedAdded.push(it.itemId);
+    }
+  });
+  return { locationId, periodKey, counts, touched, added, addedPeruntukan, addedPrice,
+    checked: true, checkedAt: nowIso, updatedAt: nowIso,
+    revision: true, base, lockedAdded, reopenedAt: nowIso, reopenedBy: by };
+}
+// Penanda "dibuka" tanpa draft (mis. sisa versi lama) -> bangun draftnya dari angka terkunci. Selalu cek ulang ke
+// database dulu (penanda masih ada & draft memang belum ada) supaya tidak menghidupkan lagi revisi yang baru dikunci.
+const opnameHealAttempts = {};
+async function ensureRevisionDraft(locationId, periodKey, force){
+  const key = locationId + '__' + periodKey;
+  if(!force && (opnameHealAttempts[key]||0) >= 2) return;
+  opnameHealAttempts[key] = (opnameHealAttempts[key]||0) + 1;
+  try{
+    const sSnap = await db.doc('opnameSessions/' + periodKey).get();
+    const sess = (sSnap && sSnap.exists) ? sSnap.data() : null;
+    const ri = sess && sess.reopened && sess.reopened[locationId];
+    if(!ri) return;
+    const dRef = db.doc('opnameDrafts/' + opnameDraftDocId(locationId, periodKey));
+    const dSnap = await dRef.get();
+    if(dSnap && dSnap.exists) return;
+    const detSnap = await db.doc('opnameDetails/' + periodKey + '__' + locationId).get();
+    if(!(detSnap && detSnap.exists)) return;
+    const det = detSnap.data();
+    // Sudah dikunci ulang setelah dibuka (revisi relock lebih baru dari penanda) tapi penandanya tersisa -> bersihkan penandanya, jangan bikin draft baru.
+    const lastRev = (Array.isArray(det.revisions) ? det.revisions : []).filter(r=>r && r.relock).slice(-1)[0];
+    if(lastRev && ri.at && lastRev.at > ri.at){
+      const nr = { ...sess.reopened }; delete nr[locationId];
+      await db.doc('opnameSessions/' + periodKey).set({ ...sess, reopened: nr, updatedAt: new Date().toISOString() });
+      const loc = state.opnameSessions.find(x=>x.periodKey===periodKey);
+      if(loc) loc.reopened = nr;
+      if(state.view==='stockopname') render();
+      return;
+    }
+    const draft = buildRevisionDraft(det, locationId, periodKey, ri.by || '', ri.at || new Date().toISOString());
+    await dRef.set(draft);
+    state.opnameDrafts = state.opnameDrafts.filter(d=>!(d.locationId===locationId && d.periodKey===periodKey)).concat([{ id: opnameDraftDocId(locationId, periodKey), ...draft }]);
+    if(state.view==='stockopname') render();
+  }catch(err){ /* coba lagi pada render berikutnya (maks 2x) atau lewat tombol Coba Lagi */ }
+}
+async function setOpnameReopen(locationId, periodKey, open){
+  try{
+    const ref = db.doc('opnameSessions/' + periodKey);
+    const snap = await ref.get();
+    const session = (snap && snap.exists) ? snap.data() : null;
+    if(!session){ toast('Sesi opname tidak ditemukan.', true); return; }
+    const reopened = { ...(session.reopened||{}) };
+    const nowIso = new Date().toISOString();
+    const draftId = 'opnameDrafts/' + opnameDraftDocId(locationId, periodKey);
+    if(open){
+      if(!(session.locationsDone||{})[locationId]){ toast('Lokasi ini belum diselesaikan.', true); return; }
+      if(reopened[locationId]){ toast('Lokasi ini sudah dibuka.', true); return; }
+      const dSnap = await db.doc('opnameDetails/' + periodKey + '__' + locationId).get();
+      const detail = (dSnap && dSnap.exists) ? dSnap.data() : null;
+      if(!detail){ toast('Data opname lokasi ini tidak ditemukan.', true); return; }
+      const draft = buildRevisionDraft(detail, locationId, periodKey, currentUserName || currentRole().name, nowIso);
+      const by = draft.reopenedBy;
+      await db.doc(draftId).set(draft);
+      try{
+        reopened[locationId] = { at: nowIso, by };
+        await ref.set({ ...session, reopened, updatedAt: nowIso });
+      }catch(e2){ try{ await db.doc(draftId).delete(); }catch(_){} throw e2; }
+      state.opnameDrafts = state.opnameDrafts.filter(d=>!(d.locationId===locationId && d.periodKey===periodKey)).concat([{ id: opnameDraftDocId(locationId, periodKey), ...draft }]);
+    } else {
+      delete reopened[locationId];
+      await ref.set({ ...session, reopened, updatedAt: nowIso });
+      try{ await db.doc(draftId).delete(); }catch(_){}
+      state.opnameDrafts = state.opnameDrafts.filter(d=>!(d.locationId===locationId && d.periodKey===periodKey));
+    }
+    const local = state.opnameSessions.find(x=>x.periodKey===periodKey);
+    if(local) local.reopened = reopened;
+    toast(open ? 'Kunci ' + whName(locationId) + ' dibuka: status kembali ke Hampir Final dengan angka sebelumnya.' : 'Buka kunci ' + whName(locationId) + ' dibatalkan, lokasi terkunci lagi seperti semula.');
+    if(state.view==='stockopname') render();
+  }catch(err){
+    toast(err.message || 'Gagal mengubah status opname. Coba lagi.', true);
+  }
+}
+/* Kunci ulang hasil revisi: memakai jalur koreksi yang sama (stok hanya
+   digeser sebesar selisih angka lama vs baru, bukan dibandingkan ke stok
+   live), lalu menghapus penanda reopened supaya lokasi terkunci lagi. */
+async function lockOpnameRevision(locationId, periodKey, draft){
+  try{
+    const snap = await db.doc('opnameDetails/' + periodKey + '__' + locationId).get();
+    const detail = (snap && snap.exists) ? snap.data() : null;
+    if(!detail){ toast('Data opname terkunci tidak ditemukan.', true); return false; }
+    const existing = new Set((detail.items||[]).map(i=>i.itemId));
+    state.opnameCorrectLocation = locationId;
+    state.opnameCorrectPeriod = periodKey;
+    opnameCorrectDetail = detail;
+    opnameCorrectQty = {};
+    opnameCorrectNewItems = [];
+    Object.keys(draft.counts||{}).forEach(id=>{
+      if(existing.has(id)){ opnameCorrectQty[id] = draft.counts[id]; return; }
+      const type = (draft.added||{})[id];
+      const item = itemById(id);
+      if(!type || !item) return;
+      const qty = draft.counts[id];
+      if(!(qty > 0)) return;
+      opnameCorrectNewItems.push({ itemId:id, itemName:item.name, kode:item.kode||'', uom: srHasSmallUnit(item) ? item.smallUnit : item.uom,
+        qty, price: (draft.addedPrice||{})[id]!=null ? draft.addedPrice[id] : 0, addedType:type, peruntukan: (draft.addedPeruntukan||{})[id]||null });
+    });
+    return await saveOpnameCorrection({ revisionLock:true });
+  }catch(err){
+    toast(err.message || 'Gagal mengunci ulang opname. Coba lagi.', true);
+    return false;
+  }
+}
 function openOpnameCorrection(locationId, periodKey){
   const role = currentRole();
-  if(role.kind!=='master'){ toast('Hanya Master User yang dapat mengoreksi opname yang sudah terkunci.', true); return; }
+  if(!canCorrectOpname(role, periodKey, locationId)){ toast('Opname ini terkunci. Minta Master User membuka akses revisi dulu.', true); return; }
   state.opnameCorrectLocation = locationId;
   state.opnameCorrectPeriod = periodKey;
   state.opnameCorrectSearch = '';
@@ -5306,14 +5508,56 @@ function opnameCorrectUpdateQty(itemId, value){
       cell.style.color = diff===0 ? 'var(--text-faint)' : (diff>0 ? 'var(--success)' : 'var(--danger)');
       cell.textContent = diff===0 ? '—' : (diff>0?'+':'')+fmtNum(diff);
     }
+    // Nilai (Rp) baris ini -- pakai harga yang tersimpan saat hitung (it.price),
+    // sama dengan yang dipakai saveOpnameCorrection untuk nilaiFisik.
+    const newVal = (newCanonical||0) * (row.price||0);
+    const oldVal = (row.physicalQty||0) * (row.price||0);
+    const vCell = document.getElementById('opnameCorrectVal-' + itemId);
+    if(vCell) vCell.textContent = fmtIDR(newVal);
+    const dCell = document.getElementById('opnameCorrectValDiff-' + itemId);
+    if(dCell){
+      const dv = Math.round(newVal - oldVal);
+      dCell.style.color = dv===0 ? 'var(--text-faint)' : (dv>0 ? 'var(--success)' : 'var(--danger)');
+      dCell.textContent = dv===0 ? '—' : (dv>0?'+':'') + fmtIDR(dv);
+    }
   }
+  updateOpnameCorrectSummary();
+}
+// Total nilai lokasi ini: yang sudah terkunci vs. setelah koreksi yang sedang
+// diketik (termasuk barang baru yang di-stage lewat "Tambah Barang").
+function opnameCorrectTotals(){
+  const detail = opnameCorrectDetail;
+  let recorded = 0, after = 0;
+  (detail && detail.items || []).forEach(it=>{
+    const oldVal = (it.nilaiFisik!=null && it.addedType) ? it.nilaiFisik : (it.physicalQty||0) * (it.price||0);
+    recorded += oldVal;
+    if(it.addedType || !opnameCorrectQty.hasOwnProperty(it.itemId)){ after += oldVal; return; }
+    const item = itemById(it.itemId);
+    const nc = (item && srHasSmallUnit(item)) ? opnameCorrectQty[it.itemId] / item.conversionQty : opnameCorrectQty[it.itemId];
+    after += (nc||0) * (it.price||0);
+  });
+  let added = 0;
+  opnameCorrectNewItems.forEach(ni=>{
+    const item = itemById(ni.itemId);
+    const physical = (item && srHasSmallUnit(item)) ? (ni.qty / item.conversionQty) : ni.qty;
+    added += ni.price!=null ? ni.price : physical * ((item && item.lastPrice)||0);
+  });
+  return { recorded, after: after + added, added };
+}
+function updateOpnameCorrectSummary(){
+  const t = opnameCorrectTotals();
+  const set = (id, txt, color)=>{ const el = document.getElementById(id); if(el){ el.textContent = txt; if(color!==undefined) el.style.color = color; } };
+  const d = Math.round(t.after - t.recorded);
+  set('opnameCorrectSumRecorded', fmtIDR(t.recorded));
+  set('opnameCorrectSumAfter', fmtIDR(t.after));
+  set('opnameCorrectSumDiff', d===0 ? '—' : (d>0?'+':'') + fmtIDR(d), d===0 ? 'var(--text-faint)' : (d>0 ? 'var(--success)' : 'var(--danger)'));
 }
 function renderOpnameCorrect(){
   const locationId = state.opnameCorrectLocation;
   const periodKey = state.opnameCorrectPeriod;
   const role = currentRole();
-  if(role.kind!=='master'){
-    document.getElementById('content').innerHTML = `<div class="lock-note">Hanya Master User yang dapat mengoreksi opname yang sudah terkunci.</div>`;
+  if(!canCorrectOpname(role, periodKey, locationId)){
+    document.getElementById('content').innerHTML = `<div class="lock-note">Opname ini terkunci. Hanya Master User, atau Receiving setelah Master membuka akses revisi, yang dapat mengoreksinya.</div>`;
     return;
   }
   if(opnameCorrectLoading){
@@ -5346,6 +5590,7 @@ function renderOpnameCorrect(){
   const isStorageLoc = isStorageWarehouse(locationId);
 
   document.getElementById('content').innerHTML = `
+    ${role.kind==='receiving' ? (()=>{ const ri = opnameReopenInfo(periodKey, locationId); return `<div class="lock-note" style="margin-bottom:10px;">Master membuka akses revisi untuk lokasi ini${ri && ri.at ? ' (' + fmtDate(ri.at) + (ri.by ? ', oleh ' + escapeHtml(ri.by) : '') + ')' : ''}. Ubah angka yang salah, lalu tekan <b>Simpan &amp; Kunci Ulang</b>. Setelah itu lokasi ini terkunci lagi.</div>`; })() : ''}
     <div class="lock-note" style="margin-bottom:14px; background:var(--warning-tint); color:var(--warning); border:1px solid var(--warning);">
       Mengoreksi hasil opname <b>${escapeHtml(whName(locationId))} — ${escapeHtml(periodLabel(periodKey))}</b> yang sudah dikunci dan menjadi data final. Stok saat ini hanya akan disesuaikan sebesar <b>selisih</b> antara angka lama dan angka baru di sini — transaksi lain yang terjadi setelah dikunci tidak akan ketimpa. Gunakan hanya untuk memperbaiki kesalahan input.
     </div>
@@ -5358,7 +5603,7 @@ function renderOpnameCorrect(){
           ${wipCategory ? `<button class="btn btn-sm btn-outline" onclick="openAddOpnameCorrectWipModal()">${ICONS.plus} Tambah Barang WIP</button>` : ''}
         </span>
       </div>
-      <div class="lock-note" style="margin:0; border-radius:0; border-left:none; border-right:none; border-top:none;">Untuk barang yang ternyata terlewat sama sekali dari hitung fisik awal (bukan salah angka pada barang yang sudah tercatat). "Tambah Barang" ikut menambah stok/inventory sebenarnya begitu koreksi ini disimpan; "Tambah Barang WIP" hanya menambah nilai tercatat, tidak memengaruhi stok. Keduanya baru benar-benar tersimpan setelah "Simpan Koreksi" di bawah ditekan.</div>
+      <div class="lock-note" style="margin:0; border-radius:0; border-left:none; border-right:none; border-top:none;">Untuk barang yang ternyata terlewat sama sekali dari hitung fisik awal (bukan salah angka pada barang yang sudah tercatat). "Tambah Barang" ikut menambah stok/inventory sebenarnya begitu koreksi ini disimpan; "Tambah Barang WIP" hanya menambah nilai tercatat, tidak memengaruhi stok. Keduanya baru benar-benar tersimpan setelah "${role.kind==='receiving' ? 'Simpan &amp; Kunci Ulang' : 'Simpan Koreksi'}" di bawah ditekan.</div>
       ${opnameCorrectNewItems.length===0 ? `<div class="empty-row" style="padding:16px;">Belum ada barang baru yang ditambahkan.</div>` : `
       <div class="table-scroll">
         <table>
@@ -5379,14 +5624,19 @@ function renderOpnameCorrect(){
     </div>` : ''}
     <div class="panel" style="margin-top:14px;">
       <div class="panel-head"><h3>Koreksi Hitung Fisik — ${escapeHtml(whName(locationId))}</h3></div>
+      <div class="panel-body" style="display:flex; gap:28px; flex-wrap:wrap; padding:12px 16px; border-bottom:1px solid var(--border);">
+        <div><div class="cell-sub">Nilai Tercatat (Terkunci)</div><div class="cell-title" id="opnameCorrectSumRecorded" style="font-size:16px;">${fmtIDR(opnameCorrectTotals().recorded)}</div></div>
+        <div><div class="cell-sub">Nilai Setelah Koreksi</div><div class="cell-title" id="opnameCorrectSumAfter" style="font-size:16px;">${fmtIDR(opnameCorrectTotals().after)}</div></div>
+        <div><div class="cell-sub">Perubahan Nilai</div><div class="cell-title" id="opnameCorrectSumDiff" style="font-size:16px;">—</div></div>
+      </div>
       <div class="filter-row">
         <input type="text" id="opnameCorrectSearchInput" placeholder="Cari barang…" value="${escapeHtml(state.opnameCorrectSearch||'')}" oninput="setOpnameCorrectSearch(this.value)">
       </div>
       <div class="table-scroll">
         <table>
-          <thead><tr><th>Barang</th><th>Satuan</th><th class="num">Tercatat (Terkunci)</th><th class="num">Koreksi</th><th class="num">Perubahan</th></tr></thead>
+          <thead><tr><th>Barang</th><th>Satuan</th><th class="num">Tercatat (Terkunci)</th><th class="num">Koreksi</th><th class="num">Perubahan</th><th class="num">Nilai Tercatat</th><th class="num">Nilai Koreksi</th><th class="num">Perubahan Nilai</th></tr></thead>
           <tbody>
-            ${items.length===0 ? `<tr class="empty-row"><td colspan="5">Tidak ada barang yang cocok.</td></tr>` :
+            ${items.length===0 ? `<tr class="empty-row"><td colspan="8">Tidak ada barang yang cocok.</td></tr>` :
               items.map(it=>{
                 const item = itemById(it.itemId);
                 const useSmall = item && srHasSmallUnit(item);
@@ -5396,12 +5646,20 @@ function renderOpnameCorrect(){
                 const newCanonical = (item && useSmall) ? (current / item.conversionQty) : current;
                 const diff = Math.round(((newCanonical||0) - (it.physicalQty||0)) * 1000) / 1000;
                 const diffColor = diff===0 ? 'var(--text-faint)' : (diff>0 ? 'var(--success)' : 'var(--danger)');
+                const priceNow = it.price||0;
+                const oldVal = (it.physicalQty||0) * priceNow;
+                const newVal = (newCanonical||0) * priceNow;
+                const dVal = Math.round(newVal - oldVal);
+                const dValColor = dVal===0 ? 'var(--text-faint)' : (dVal>0 ? 'var(--success)' : 'var(--danger)');
                 return `<tr>
                   <td class="cell-title">${escapeHtml(it.itemName)}</td>
                   <td>${escapeHtml(unit||'')}${useSmall ? `<div class="cell-sub">1 ${escapeHtml(item.uom)} = ${fmtNum(item.conversionQty)} ${escapeHtml(item.smallUnit)}</div>` : ''}</td>
                   <td class="num">${fmtNum(recorded)}</td>
                   <td class="num"><input type="text" inputmode="decimal" style="width:96px; text-align:right;" value="${fmtQtyInputValue(current)}" oninput="formatQtyInput(this); opnameCorrectUpdateQty('${it.itemId}', this.value)"></td>
                   <td class="num" id="opnameCorrectDiff-${it.itemId}" style="color:${diffColor}; font-weight:700;">${diff===0?'—':(diff>0?'+':'')+fmtNum(diff)}</td>
+                  <td class="num">${fmtIDR(oldVal)}<div class="cell-sub">@ ${fmtIDR(priceNow)}/${escapeHtml((item && item.uom) || it.uom || '')}</div></td>
+                  <td class="num" id="opnameCorrectVal-${it.itemId}">${fmtIDR(newVal)}</td>
+                  <td class="num" id="opnameCorrectValDiff-${it.itemId}" style="color:${dValColor}; font-weight:700;">${dVal===0?'—':(dVal>0?'+':'')+fmtIDR(dVal)}</td>
                 </tr>`;
               }).join('')}
           </tbody>
@@ -5410,9 +5668,10 @@ function renderOpnameCorrect(){
     </div>
     <div class="action-row" style="justify-content:flex-end; gap:8px;">
       <button class="btn btn-outline" onclick="backToOpnameList()">Batal</button>
-      <button class="btn btn-primary" onclick="confirmSaveOpnameCorrection()">Simpan Koreksi</button>
+      <button class="btn btn-primary" onclick="confirmSaveOpnameCorrection()">${role.kind==='receiving' ? 'Simpan &amp; Kunci Ulang' : 'Simpan Koreksi'}</button>
     </div>
   `;
+  updateOpnameCorrectSummary();
 }
 // Which itemIds are already spoken for in this correction screen -- either
 // already part of the locked opname's own items, or already staged as a new
@@ -5593,19 +5852,35 @@ function confirmSaveOpnameCorrection(){
   const parts = [];
   if(changed.length>0) parts.push('mengubah ' + changed.length + ' barang');
   if(newCount>0) parts.push('menambah ' + newCount + ' barang baru');
+  const tot = opnameCorrectTotals();
+  const dTot = Math.round(tot.after - tot.recorded);
+  const isRecv = currentRole().kind==='receiving';
   openConfirm(
-    'Simpan Koreksi Opname',
-    'Ini akan ' + parts.join(' dan ') + ' pada data opname yang sudah final untuk ' + whName(state.opnameCorrectLocation) + ' — ' + periodLabel(state.opnameCorrectPeriod) + ', dan menyesuaikan stok saat ini seperlunya. Pastikan koreksi ini benar sebelum melanjutkan. Lanjutkan?',
+    isRecv ? 'Simpan & Kunci Ulang Opname' : 'Simpan Koreksi Opname',
+    'Ini akan ' + parts.join(' dan ') + ' pada data opname untuk ' + whName(state.opnameCorrectLocation) + ' — ' + periodLabel(state.opnameCorrectPeriod) + ', dan menyesuaikan stok saat ini seperlunya. Nilai berubah dari ' + fmtIDR(tot.recorded) + ' menjadi ' + fmtIDR(tot.after) + ' (' + (dTot>0?'+':'') + fmtIDR(dTot) + ').' + (isRecv ? ' Setelah disimpan, lokasi ini terkunci lagi.' : '') + ' Pastikan angkanya benar sebelum melanjutkan. Lanjutkan?',
     ()=>saveOpnameCorrection(),
-    'Simpan Koreksi', true
+    isRecv ? 'Simpan & Kunci' : 'Simpan Koreksi', true
   );
 }
-async function saveOpnameCorrection(){
+async function saveOpnameCorrection(opts){
+  const revLock = !!(opts && opts.revisionLock);
   const locationId = state.opnameCorrectLocation;
   const periodKey = state.opnameCorrectPeriod;
   const detail = opnameCorrectDetail;
-  if(!detail) return;
+  if(!detail) return false;
   try{
+    // Cek ulang akses dari data terbaru -- Master mungkin menutup akses revisi
+    // saat Receiving sedang mengetik.
+    if(revLock || currentRole().kind!=='master'){
+      const sSnap = await db.doc('opnameSessions/' + periodKey).get();
+      const sData = (sSnap && sSnap.exists) ? sSnap.data() : null;
+      if(!(sData && sData.reopened && sData.reopened[locationId])){
+        toast('Revisi untuk lokasi ini sudah dibatalkan Master. Perubahan tidak disimpan.', true);
+        return false;
+      }
+    }
+    const noteWho = revLock ? 'Revisi Opname' : 'Koreksi Master';
+    let changedCount = 0;
     const isStorage = isStorageWarehouse(locationId);
     const newItems = detail.items.map(it=>({...it, peruntukanQty: it.peruntukanQty ? {...it.peruntukanQty} : it.peruntukanQty}));
     const peruntukanValues = detail.peruntukanValues ? {...detail.peruntukanValues} : null;
@@ -5617,6 +5892,7 @@ async function saveOpnameCorrection(){
       const newCanonical = srHasSmallUnit(item) ? (opnameCorrectQty[it.itemId] / item.conversionQty) : opnameCorrectQty[it.itemId];
       const delta = Math.round((newCanonical - (it.physicalQty||0)) * 1000) / 1000;
       if(Math.abs(delta) < 0.0001) continue;
+      changedCount++;
       // Snapshot the REAL proportional split this correction is about to
       // write, before writing it -- same pattern actionSubmitOpnameCount
       // uses (previewStorageReduction/previewStorageIncrease read live
@@ -5650,7 +5926,7 @@ async function saveOpnameCorrection(){
         itemId: it.itemId, itemName: it.itemName, uom: item.uom, qty: Math.abs(delta),
         toWarehouseId: delta>0 ? locationId : null, toWarehouseName: delta>0 ? whName(locationId) : null,
         fromWarehouseId: delta<0 ? locationId : null, fromWarehouseName: delta<0 ? whName(locationId) : null,
-        note: 'Koreksi Master atas Stok Opname ' + periodLabel(periodKey) + ' (terkunci): ' + fmtNum(it.physicalQty||0) + ' → ' + fmtNum(newCanonical) + ' ' + item.uom,
+        note: noteWho + ' atas Stok Opname ' + periodLabel(periodKey) + ' (terkunci): ' + fmtNum(it.physicalQty||0) + ' → ' + fmtNum(newCanonical) + ' ' + item.uom,
       });
       it.nilaiFisik = newCanonical * (it.price||0);
       it.physicalQty = newCanonical;
@@ -5710,7 +5986,7 @@ async function saveOpnameCorrection(){
           type:'opname', status:'completed',
           itemId: ni.itemId, itemName: item.name, uom: item.uom, qty: Math.abs(physical),
           toWarehouseId: locationId, toWarehouseName: whName(locationId),
-          note: 'Koreksi Master atas Stok Opname ' + periodLabel(periodKey) + ' (terkunci) — barang terlewat ditambahkan: ' + fmtNum(physical) + ' ' + item.uom + (isStorage ? ' (' + peruntukanName(ni.peruntukan) + ')' : ''),
+          note: noteWho + ' atas Stok Opname ' + periodLabel(periodKey) + ' (terkunci) — barang terlewat ditambahkan: ' + fmtNum(physical) + ' ' + item.uom + (isStorage ? ' (' + peruntukanName(ni.peruntukan) + ')' : ''),
         });
       }
       // 'wip' tidak pernah menyentuh stok nyata, persis seperti submitAddWip().
@@ -5726,9 +6002,16 @@ async function saveOpnameCorrection(){
     const totalAddedGoodsValue = (detail.totalAddedGoodsValue||0) + addedGoodsValueDelta;
     const totalAddedWipValue = (detail.totalAddedWipValue||0) + addedWipValueDelta;
 
+    // Jejak revisi (20 terakhir): siapa, kapan, berapa barang, nilai sebelum/sesudah.
+    const revisions = (Array.isArray(detail.revisions) ? detail.revisions : []).concat([{
+      at: new Date().toISOString(), by: currentUserName || currentRole().name, role: currentRole().name,
+      changed: changedCount, added: opnameCorrectNewItems.length, relock: revLock,
+      valueBefore: detail.totalValue!=null ? detail.totalValue : null, valueAfter: totalValue,
+    }]).slice(-20);
     await db.doc('opnameDetails/' + periodKey + '__' + locationId).update({
       items: newItems, totalValue, totalUsedValue, totalAddedGoodsValue, totalAddedWipValue,
       ...(peruntukanValues ? {peruntukanValues} : {}),
+      revisions,
       correctedAt: new Date().toISOString(), correctedBy: currentUserName || currentRole().name,
     });
 
@@ -5739,6 +6022,11 @@ async function saveOpnameCorrection(){
       const mergedValues = { ...(session.locationValues||{}), [locationId]: totalValue };
       const mergedUsed = { ...(session.locationUsedValues||{}), [locationId]: totalUsedValue };
       const patch = { locationValues: mergedValues, locationUsedValues: mergedUsed, updatedAt: new Date().toISOString() };
+      // Receiving yang menyimpan revisi = menyelesaikan ulang: kunci lagi.
+      if(revLock && session.reopened && session.reopened[locationId]){
+        const nr = { ...session.reopened }; delete nr[locationId];
+        patch.reopened = nr;
+      }
       if(addedGoodsValueDelta || addedWipValueDelta){
         patch.locationAddedGoodsValues = { ...(session.locationAddedGoodsValues||{}), [locationId]: ((session.locationAddedGoodsValues||{})[locationId]||0) + addedGoodsValueDelta };
         patch.locationAddedWipValues = { ...(session.locationAddedWipValues||{}), [locationId]: ((session.locationAddedWipValues||{})[locationId]||0) + addedWipValueDelta };
@@ -5750,14 +6038,20 @@ async function saveOpnameCorrection(){
         patch.totalValue = Object.values(mergedValues).reduce((s,v)=>s+v,0);
         patch.groupValues = await computeGroupValuesFromOpnameDetails(periodKey);
       }
-      await sessionRef.update(patch);
+      await sessionRef.set({ ...session, ...patch }); // set, bukan update: update menggabungkan map bertingkat sehingga penanda `reopened` yang dihapus tetap tersisa
     }
     delete state.reportOpname.histCache[periodKey]; // Laporan Stock Opname (R1) harus baca ulang, bukan versi lama yang mungkin sudah ke-cache
     opnameCorrectNewItems = [];
-    toast('Koreksi opname ' + whName(locationId) + ' tersimpan.');
+    toast(revLock ? 'Revisi opname ' + whName(locationId) + ' tersimpan dan terkunci lagi.' : 'Koreksi opname ' + whName(locationId) + ' tersimpan.');
+    if(revLock){
+      const local = state.opnameSessions.find(x=>x.periodKey===periodKey);
+      if(local && local.reopened){ const nr = {...local.reopened}; delete nr[locationId]; local.reopened = nr; }
+    }
     backToOpnameList();
+    return true;
   }catch(err){
     toast(err.message || 'Gagal menyimpan koreksi. Coba lagi.', true);
+    return false;
   }
 }
 
