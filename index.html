@@ -4836,12 +4836,16 @@ function renderStokOpname(){
               } else {
                 actionsHtml = `<button class="btn btn-sm btn-outline" onclick="openOpnameCounting('${w.id}')">Mulai Opname</button>`;
               }
+              // Belum dikunci tapi ada draft (termasuk Hampir Final & revisi): tampilkan estimasi nominalnya supaya Receiving/Master tahu nilainya sebelum dikunci.
+              const est = (draft && Object.keys(draft.counts||{}).length) ? opnameDraftValues(w.id, draft) : null;
+              const estCell = (v, color)=> `<span style="font-style:italic;${color?' color:'+color+';':''}">${fmtIDR(Math.round(v))}</span><div class="cell-sub">estimasi draft</div>`;
+              const estSelColor = est ? (Math.round(est.selisih)>0 ? 'var(--success)' : (Math.round(est.selisih)<0 ? 'var(--danger)' : 'var(--text-faint)')) : null;
               return `<tr>
                 <td class="cell-title">${w.name}</td>
-                <td class="num">${done ? fmtIDR(locationValues[w.id]) : '—'}</td>
-                <td class="num">${done ? fmtIDR(locationAddedGoodsValues[w.id]||0) : '—'}</td>
-                <td class="num">${done ? fmtIDR(locationAddedWipValues[w.id]||0) : '—'}</td>
-                <td class="num" style="color:${selisihColor};">${done ? fmtIDR(selisihVal||0) : '—'}</td>
+                <td class="num">${est ? estCell(est.total) + (done ? `<div class="cell-sub">terkunci: ${fmtIDR(locationValues[w.id])}</div>` : '') : (done ? fmtIDR(locationValues[w.id]) : '—')}</td>
+                <td class="num">${est ? estCell(est.goods) : (done ? fmtIDR(locationAddedGoodsValues[w.id]||0) : '—')}</td>
+                <td class="num">${est ? estCell(est.wip) : (done ? fmtIDR(locationAddedWipValues[w.id]||0) : '—')}</td>
+                <td class="num" style="color:${est ? 'inherit' : selisihColor};">${est ? estCell(est.selisih, estSelColor) + (done ? `<div class="cell-sub">terkunci: ${fmtIDR(selisihVal||0)}</div>` : '') : (done ? fmtIDR(selisihVal||0) : '—')}</td>
                 <td>${statusTag}</td>
                 <td>${actionsHtml}</td>
               </tr>`;
@@ -5113,6 +5117,53 @@ function opnameSystemDisplay(locationId, item){
   const system = stockQty(locationId, item.id);
   return srHasSmallUnit(item) ? system * item.conversionQty : system;
 }
+// Rupiah value of one counting row: {val: nilai fisik, diff: selisih nilai (fisik - sistem)}; added (Tambahan/WIP) rows use their manual total and have no system side.
+function opnameRowValues(locationId, item, countedDisplay){
+  const useSmall = srHasSmallUnit(item);
+  const canon = useSmall ? (countedDisplay||0) / item.conversionQty : (countedDisplay||0);
+  const addedType = opnameAdded[item.id];
+  const rb = opnameRevisionMeta && opnameRevisionMeta.base[item.id];
+  const unit = (rb && rb.pr!=null) ? rb.pr : (item.lastPrice||0);
+  if(addedType){
+    const v = opnameAddedPrice[item.id]!=null ? opnameAddedPrice[item.id] : canon * unit;
+    return { val: v, diff: v, added: true };
+  }
+  const sysCanon = useSmall ? opnameSystemDisplay(locationId, item) / item.conversionQty : opnameSystemDisplay(locationId, item);
+  return { val: canon * unit, diff: (canon - sysCanon) * unit, added: false };
+}
+// Nilai Fisik (Rp) with the selisih value underneath: small, italic, in parentheses, green for plus / red for minus.
+function opnameValCellHtml(r){
+  const dv = Math.round(r.diff);
+  const color = dv===0 ? 'var(--text-faint)' : (dv>0 ? 'var(--success)' : 'var(--danger)');
+  const txt = dv===0 ? '(—)' : '(' + (dv>0 ? '+' : '−') + fmtIDR(Math.abs(dv)) + ')';
+  return fmtIDR(Math.round(r.val)) + '<div style="font-size:10.5px; font-style:italic; font-weight:500; color:' + color + ';">' + txt + '</div>';
+}
+function opnameSetValueCells(itemId){
+  const item = itemById(itemId); if(!item) return;
+  const r = opnameRowValues(state.opnameCountLocation, item, opnameCounts[itemId]);
+  const vc = document.getElementById('opnameVal-' + itemId);
+  if(vc) vc.innerHTML = opnameValCellHtml(r);
+}
+// Estimated Rp totals of a not-yet-locked draft, for the Stok Opname list (before Hampir Final / lock).
+function opnameDraftValues(locationId, draft){
+  let total = 0, selisih = 0, goods = 0, wip = 0;
+  const base = draft.revision ? (draft.base||{}) : null;
+  Object.keys(draft.counts||{}).forEach(id=>{
+    const item = itemById(id); if(!item) return;
+    const useSmall = srHasSmallUnit(item);
+    const canon = useSmall ? draft.counts[id] / item.conversionQty : draft.counts[id];
+    const at = (draft.added||{})[id];
+    const unit = (base && base[id] && base[id].pr!=null) ? base[id].pr : (item.lastPrice||0);
+    if(at){
+      const v = (draft.addedPrice||{})[id]!=null ? draft.addedPrice[id] : canon * unit;
+      total += v; selisih += v; if(at==='wip') wip += v; else goods += v;
+      return;
+    }
+    const sys = base ? (base[id] ? (base[id].s||0) : 0) : stockQty(locationId, id);
+    total += canon * unit; selisih += (canon - sys) * unit;
+  });
+  return { total, selisih, goods, wip };
+}
 function opnameUpdateCount(itemId, value){
   opnameCounts[itemId] = parseQtyInput(value);
   opnameTouched[itemId] = true;
@@ -5125,12 +5176,13 @@ function opnameUpdateCount(itemId, value){
     cell.style.color = diff===0 ? 'var(--text-faint)' : (diff>0 ? 'var(--success)' : 'var(--danger)');
     cell.textContent = diff===0 ? '—' : (diff>0?'+':'')+fmtNum(diff);
   }
+  opnameSetValueCells(itemId);
   opnameUpdateTotals();
   scheduleOpnameDraftSave();
 }
 function opnameUpdateTotals(){
   const locationId = state.opnameCountLocation;
-  let totalValue = 0, addedGoodsValue = 0, addedWipValue = 0, changedCount = 0;
+  let totalValue = 0, addedGoodsValue = 0, addedWipValue = 0, changedCount = 0, selisihValue = 0;
   Object.keys(opnameCounts).forEach(itemId=>{
     const item = itemById(itemId);
     if(!item) return;
@@ -5150,12 +5202,15 @@ function opnameUpdateTotals(){
     if(!addedType){
       const systemDisplay = opnameSystemDisplay(locationId, item);
       if(Math.abs(opnameCounts[itemId] - systemDisplay) > 0.0001) changedCount++;
-    }
+      const sysCanon = useSmall ? systemDisplay / item.conversionQty : systemDisplay;
+      selisihValue += (canonicalQty - sysCanon) * unitPrice;
+    } else selisihValue += value;
   });
   const hint = document.getElementById('opnameTotalHint');
   if(hint) hint.innerHTML = 'Total Nilai (fisik): <b>' + fmtIDR(totalValue) + '</b>'
     + (addedGoodsValue>0 ? ' · Penambahan Barang: <b>' + fmtIDR(addedGoodsValue) + '</b>' : '')
     + (addedWipValue>0 ? ' · Penambahan WIP: <b>' + fmtIDR(addedWipValue) + '</b>' : '')
+    + ' · Selisih Nilai: <b style="color:' + (Math.round(selisihValue)===0 ? 'inherit' : (selisihValue>0 ? 'var(--success)' : 'var(--danger)')) + ';">' + (Math.round(selisihValue)>0?'+':'') + fmtIDR(Math.round(selisihValue)) + '</b>'
     + ' · ' + changedCount + ' barang direvisi';
 }
 function wipCategoryFor(locationId){
@@ -5225,9 +5280,9 @@ function renderOpnameCounting(){
       <div class="lock-note" style="margin:0; border-radius:0; border-left:none; border-right:none; border-top:none;">Barang yang punya konversi Satuan Kecil dihitung langsung dalam satuan kecil untuk akurasi maksimal.</div>
       <div class="table-scroll">
         <table>
-          <thead><tr><th>Barang</th>${isStorage?'<th>Peruntukan</th>':''}<th>Satuan Hitung</th><th class="num">Stok Sistem</th><th class="num">Jumlah Fisik</th><th class="num">Selisih</th></tr></thead>
+          <thead><tr><th>Barang</th>${isStorage?'<th>Peruntukan</th>':''}<th>Satuan Hitung</th><th class="num">Stok Sistem</th><th class="num">Jumlah Fisik</th><th class="num">Selisih</th><th class="num">Nilai Fisik</th></tr></thead>
           <tbody>
-            ${pageItems.length===0 ? `<tr class="empty-row"><td colspan="${isStorage?6:5}">Tidak ada barang yang cocok.</td></tr>` :
+            ${pageItems.length===0 ? `<tr class="empty-row"><td colspan="${isStorage?7:6}">Tidak ada barang yang cocok.</td></tr>` :
               pageItems.map(item=>{
                 const useSmall = srHasSmallUnit(item);
                 const countUnit = useSmall ? item.smallUnit : item.uom;
@@ -5243,6 +5298,7 @@ function renderOpnameCounting(){
                 // sendiri di kolom "Stok Sistem" di sebelah kanan, jadi angka di
                 // sini cuma duplikat (dan untuk barang dengan 1 peruntukan saja,
                 // yang paling umum, malah terlihat aneh diulang persis sama).
+                const rv = opnameRowValues(locationId, item, counted);
                 const peruntukanLabel = peruntukanParts.length ? peruntukanParts.map(p=>escapeHtml(p.name)).join(' · ') : '—';
                 return `<tr>
                   <td class="cell-title">${escapeHtml(item.name)}${isWip?' <span class="tag tag-pending" style="font-size:9px; padding:1px 6px;">WIP</span>':''}${(!isWip && isAdded)?' <span class="tag tag-pending" style="font-size:9px; padding:1px 6px;">Tambahan</span>':''}</td>
@@ -5251,6 +5307,7 @@ function renderOpnameCounting(){
                   <td class="num">${fmtNum(systemDisplay)}</td>
                   <td class="num"><input type="text" inputmode="decimal" style="width:96px; text-align:right;" value="${touched ? fmtQtyInputValue(counted) : ''}" placeholder="0" ${(opnameRevisionMeta && opnameRevisionMeta.lockedAdded.includes(item.id)) ? 'disabled title="Barang Tambahan/WIP yang sudah tercatat tidak bisa direvisi di sini"' : ''} oninput="formatQtyInput(this); opnameUpdateCount('${item.id}', this.value)"></td>
                   <td class="num" id="opnameDiff-${item.id}" style="color:${diffColor}; font-weight:700;">${diff===0?'—':(diff>0?'+':'')+fmtNum(diff)}</td>
+                  <td class="num" id="opnameVal-${item.id}">${opnameValCellHtml(rv)}</td>
                 </tr>`;
               }).join('')}
           </tbody>
