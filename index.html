@@ -5117,6 +5117,13 @@ function opnameSystemDisplay(locationId, item){
   const system = stockQty(locationId, item.id);
   return srHasSmallUnit(item) ? system * item.conversionQty : system;
 }
+function opnameAddedValueFor(itemId, canon, priceMap){
+  const orig = priceMap[itemId];
+  if(orig==null) return null;
+  const m = opnameRevisionMeta;
+  if(m && m.lockedAdded.includes(itemId) && m.base[itemId] && m.base[itemId].p > 0) return canon * orig / m.base[itemId].p;
+  return orig;
+}
 // Rupiah value of one counting row: {val: nilai fisik, diff: selisih nilai (fisik - sistem)}; added (Tambahan/WIP) rows use their manual total and have no system side.
 function opnameRowValues(locationId, item, countedDisplay){
   const useSmall = srHasSmallUnit(item);
@@ -5125,7 +5132,8 @@ function opnameRowValues(locationId, item, countedDisplay){
   const rb = opnameRevisionMeta && opnameRevisionMeta.base[item.id];
   const unit = (rb && rb.pr!=null) ? rb.pr : (item.lastPrice||0);
   if(addedType){
-    const v = opnameAddedPrice[item.id]!=null ? opnameAddedPrice[item.id] : canon * unit;
+    const ov = opnameAddedValueFor(item.id, canon, opnameAddedPrice);
+    const v = ov!=null ? ov : canon * unit;
     return { val: v, diff: v, added: true };
   }
   const sysCanon = useSmall ? opnameSystemDisplay(locationId, item) / item.conversionQty : opnameSystemDisplay(locationId, item);
@@ -5155,7 +5163,8 @@ function opnameDraftValues(locationId, draft){
     const at = (draft.added||{})[id];
     const unit = (base && base[id] && base[id].pr!=null) ? base[id].pr : (item.lastPrice||0);
     if(at){
-      const v = (draft.addedPrice||{})[id]!=null ? draft.addedPrice[id] : canon * unit;
+      let v = (draft.addedPrice||{})[id]!=null ? draft.addedPrice[id] : canon * unit;
+      if(draft.revision && (draft.lockedAdded||[]).includes(id) && base[id] && base[id].p > 0 && (draft.addedPrice||{})[id]!=null) v = canon * draft.addedPrice[id] / base[id].p;
       total += v; selisih += v; if(at==='wip') wip += v; else goods += v;
       return;
     }
@@ -5189,7 +5198,7 @@ function opnameUpdateTotals(){
     const useSmall = srHasSmallUnit(item);
     const canonicalQty = useSmall ? (opnameCounts[itemId] / item.conversionQty) : opnameCounts[itemId];
     const addedType = opnameAdded[itemId];
-    const priceOverride = (addedType && opnameAddedPrice[itemId]!=null) ? opnameAddedPrice[itemId] : null;
+    const priceOverride = addedType ? opnameAddedValueFor(itemId, canonicalQty, opnameAddedPrice) : null;
     const revBase = opnameRevisionMeta && opnameRevisionMeta.base[itemId];
     const unitPrice = (revBase && revBase.pr!=null) ? revBase.pr : (item.lastPrice||0);
     const value = priceOverride!=null ? priceOverride : canonicalQty * unitPrice;
@@ -5305,7 +5314,7 @@ function renderOpnameCounting(){
                   ${isStorage?`<td>${peruntukanLabel}</td>`:''}
                   <td>${escapeHtml(countUnit||'')}${useSmall ? `<div class="cell-sub">1 ${escapeHtml(item.uom)} = ${fmtNum(item.conversionQty)} ${escapeHtml(item.smallUnit)}</div>` : ''}</td>
                   <td class="num">${fmtNum(systemDisplay)}</td>
-                  <td class="num"><input type="text" inputmode="decimal" style="width:96px; text-align:right;" value="${touched ? fmtQtyInputValue(counted) : ''}" placeholder="0" ${(opnameRevisionMeta && opnameRevisionMeta.lockedAdded.includes(item.id)) ? 'disabled title="Barang Tambahan/WIP yang sudah tercatat tidak bisa direvisi di sini"' : ''} oninput="formatQtyInput(this); opnameUpdateCount('${item.id}', this.value)"></td>
+                  <td class="num"><input type="text" inputmode="decimal" style="width:96px; text-align:right;" value="${touched ? fmtQtyInputValue(counted) : ''}" placeholder="0" oninput="formatQtyInput(this); opnameUpdateCount('${item.id}', this.value)"></td>
                   <td class="num" id="opnameDiff-${item.id}" style="color:${diffColor}; font-weight:700;">${diff===0?'—':(diff>0?'+':'')+fmtNum(diff)}</td>
                   <td class="num" id="opnameVal-${item.id}">${opnameValCellHtml(rv)}</td>
                 </tr>`;
@@ -5941,8 +5950,9 @@ async function saveOpnameCorrection(opts){
     const isStorage = isStorageWarehouse(locationId);
     const newItems = detail.items.map(it=>({...it, peruntukanQty: it.peruntukanQty ? {...it.peruntukanQty} : it.peruntukanQty}));
     const peruntukanValues = detail.peruntukanValues ? {...detail.peruntukanValues} : null;
+    let addedGoodsValueDelta = 0, addedWipValueDelta = 0;
     for(const it of newItems){
-      if(it.addedType) continue;
+      if(it.addedType && !revLock) continue;
       if(!opnameCorrectQty.hasOwnProperty(it.itemId)) continue;
       const item = itemById(it.itemId);
       if(!item) continue;
@@ -5950,6 +5960,35 @@ async function saveOpnameCorrection(opts){
       const delta = Math.round((newCanonical - (it.physicalQty||0)) * 1000) / 1000;
       if(Math.abs(delta) < 0.0001) continue;
       changedCount++;
+      if(it.addedType){
+        // Tambahan/WIP yang sudah tercatat (hanya lewat revisi): nilai tercatatnya ikut berubah
+        // proporsional dengan jumlahnya (nilai per satuan tetap). 'goods' menggeser stok sebesar selisih
+        // jumlah di kantong Peruntukan tempat barang itu dulu ditambahkan; 'wip' tidak menyentuh stok.
+        const oldPhys = it.physicalQty||0;
+        const oldVal = it.nilaiFisik!=null ? it.nilaiFisik : oldPhys * (it.price||0);
+        const newVal = oldPhys > 0 ? oldVal * newCanonical / oldPhys : oldVal;
+        if(it.addedType==='goods'){
+          const per = isStorage ? (it.addedPeruntukan || 'mix') : null;
+          await adjustStock(locationId, it.itemId, delta, per, {allowNegative:true});
+          await logTx({
+            type:'opname', status:'completed',
+            itemId: it.itemId, itemName: it.itemName, uom: item.uom, qty: Math.abs(delta),
+            toWarehouseId: delta>0 ? locationId : null, toWarehouseName: delta>0 ? whName(locationId) : null,
+            fromWarehouseId: delta<0 ? locationId : null, fromWarehouseName: delta<0 ? whName(locationId) : null,
+            note: noteWho + ' atas Stok Opname ' + periodLabel(periodKey) + ' (terkunci) — barang tambahan: ' + fmtNum(oldPhys) + ' → ' + fmtNum(newCanonical) + ' ' + item.uom,
+          });
+          if(isStorage && it.peruntukanQty && per){ it.peruntukanQty[per] = (it.peruntukanQty[per]||0) + delta; }
+          if(isStorage && peruntukanValues && per){ peruntukanValues[per] = (peruntukanValues[per]||0) + (newVal - oldVal); }
+          addedGoodsValueDelta += (newVal - oldVal);
+        } else {
+          addedWipValueDelta += (newVal - oldVal);
+        }
+        it.physicalQty = newCanonical;
+        it.nilaiFisik = newVal;
+        it.selisih = newCanonical;
+        it.nilaiSelisih = newVal;
+        continue;
+      }
       // Snapshot the REAL proportional split this correction is about to
       // write, before writing it -- same pattern actionSubmitOpnameCount
       // uses (previewStorageReduction/previewStorageIncrease read live
@@ -6003,7 +6042,6 @@ async function saveOpnameCorrection(opts){
     // belum pernah tercatat di opname/lokasi ini, jadi delta = qty penuh),
     // 'wip' hanya menambah Nilai Tercatat tanpa pernah menyentuh stok sama
     // sekali -- persis seperti alur hitung fisik biasa.
-    let addedGoodsValueDelta = 0, addedWipValueDelta = 0;
     for(const ni of opnameCorrectNewItems){
       const item = itemById(ni.itemId);
       if(!item) continue;
