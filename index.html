@@ -9591,13 +9591,18 @@ function submitMonthlyNetSales(periodKey){
   actionSaveMonthlyNetSales(periodKey, foodVal, bevVal);
 }
 function report3Rows(periodKey){
-  const purchaseMap = state.reportOpname.purchaseCache[periodKey] || {};
+  // Actual Cost = Selisih (penggunaan) Kitchen / Bar di Nilai Penggunaan per Divisi:
+  // Persediaan Awal + Pembelian - Persediaan Akhir. null kalau persediaan awal/akhir periode itu belum ada.
+  const r2 = report2Rows(periodKey);
+  const usageOf = id => { const r = r2.find(x=>x.id===id); return (r && r.usage!=null) ? r.usage : null; };
   const ns = monthlyNetSalesFor(periodKey);
   return [
-    { label:'Food Cost', actual: purchaseMap.kitchen||0, netSales: ns ? Number(ns.netSalesFood||0) : 0, hasNs: !!(ns && ns.netSalesFood) },
-    { label:'Beverage Cost', actual: purchaseMap.bar||0, netSales: ns ? Number(ns.netSalesBeverage||0) : 0, hasNs: !!(ns && ns.netSalesBeverage) },
+    { label:'Food Cost', actual: usageOf('kitchen'), netSales: ns ? Number(ns.netSalesFood||0) : 0, hasNs: !!(ns && ns.netSalesFood) },
+    { label:'Beverage Cost', actual: usageOf('bar'), netSales: ns ? Number(ns.netSalesBeverage||0) : 0, hasNs: !!(ns && ns.netSalesBeverage) },
   ];
 }
+function r3ActualTxt(r){ return r.actual==null ? 'belum bisa dihitung' : fmtIDR(r.actual); }
+function r3PctTxt(r){ return (r.hasNs && r.actual!=null) ? (r.actual/r.netSales*100).toFixed(2).replace('.',',')+'%' : '—'; }
 function reportOpnameR3Html(){
   const finalizedPeriods = finalizedOpnamePeriodOptions();
   const periodKey = state.reportOpname.period;
@@ -9629,14 +9634,14 @@ function reportOpnameR3Html(){
           <tbody>
             ${rows.map(r=>`<tr>
               <td class="cell-title">${r.label}</td>
-              <td class="num">${fmtIDR(r.actual)}</td>
+              <td class="num">${r.actual==null ? '<span class="cell-sub">belum bisa dihitung</span>' : fmtIDR(r.actual)}</td>
               <td class="num">${r.hasNs ? fmtIDR(r.netSales) : '<span class="cell-sub">Net Sales belum diisi</span>'}</td>
-              <td class="num">${r.hasNs ? (r.actual/r.netSales*100).toFixed(2).replace('.',',')+'%' : '—'}</td>
+              <td class="num">${r3PctTxt(r)}</td>
             </tr>`).join('')}
           </tbody>
         </table>
       </div>
-      <div class="lock-note">Actual Cost = Pembelian (barang masuk) untuk Kitchen / Bar pada periode ini (sama dengan kolom Pembelian di Nilai Penggunaan per Divisi). Actual COGS % tidak dihitung selama Net Sales belum diisi — tidak ditampilkan sebagai 0%.</div>
+      <div class="lock-note">Actual Cost = Selisih (penggunaan) Kitchen / Bar di Nilai Penggunaan per Divisi, yaitu Persediaan Awal + Pembelian − Persediaan Akhir. Kalau Persediaan Awal (periode sebelumnya belum difinalisasi) atau Persediaan Akhir belum ada, Actual Cost tampil "belum bisa dihitung". Actual COGS % tidak dihitung selama Net Sales belum diisi — tidak ditampilkan sebagai 0%.</div>
       `}
       `}
     </div>
@@ -9653,7 +9658,7 @@ async function exportReport3Excel(){
     ['Food & Beverage Cost — ' + periodLabel(periodKey)],
     [],
     ['Jenis Cost','Actual Cost','Net Sales','Actual COGS (%)'],
-    ...rows.map(r=>[r.label, Math.round(r.actual), r.hasNs?Math.round(r.netSales):'', r.hasNs?Number((r.actual/r.netSales*100).toFixed(2)):'Net Sales belum diisi']),
+    ...rows.map(r=>[r.label, r.actual==null?'belum bisa dihitung':Math.round(r.actual), r.hasNs?Math.round(r.netSales):'', !r.hasNs?'Net Sales belum diisi':(r.actual==null?'':Number((r.actual/r.netSales*100).toFixed(2)))]),
   ];
   const headerRowIdx = 3;
   const wb = XLSXStyle.utils.book_new();
@@ -9682,7 +9687,7 @@ async function exportReport3Pdf(){
   doc.autoTable({
     startY: y, margin:{left:margin, right:margin},
     head: [['Jenis Cost','Actual Cost','Net Sales','Actual COGS (%)']],
-    body: rows.map(r=>[r.label, fmtIDR(r.actual), r.hasNs?fmtIDR(r.netSales):'Net Sales belum diisi', r.hasNs?(r.actual/r.netSales*100).toFixed(2).replace('.',',')+'%':'—']),
+    body: rows.map(r=>[r.label, r3ActualTxt(r), r.hasNs?fmtIDR(r.netSales):'Net Sales belum diisi', r3PctTxt(r)]),
     styles:{fontSize:9.5, cellPadding:6},
     headStyles:{fillColor:[107,63,34], textColor:255},
     // Fixed cellWidth per column -- sums to the page's usable width.
@@ -9939,7 +9944,7 @@ function buildReport3SheetInto(wb){
     ['Food & Beverage Cost — ' + periodLabel(periodKey)],
     [],
     ['Jenis Cost','Actual Cost','Net Sales','Actual COGS (%)'],
-    ...rows.map(r=>[r.label, Math.round(r.actual), r.hasNs?Math.round(r.netSales):'', r.hasNs?Number((r.actual/r.netSales*100).toFixed(2)):'Net Sales belum diisi']),
+    ...rows.map(r=>[r.label, r.actual==null?'belum bisa dihitung':Math.round(r.actual), r.hasNs?Math.round(r.netSales):'', !r.hasNs?'Net Sales belum diisi':(r.actual==null?'':Number((r.actual/r.netSales*100).toFixed(2)))]),
   ];
   const headerRowIdx = 3;
   const ws = XLSXStyle.utils.aoa_to_sheet(aoa);
@@ -10105,7 +10110,7 @@ function drawReport3PdfSection(doc, isFirst){
   doc.autoTable({
     startY: y, margin:{left:margin, right:margin},
     head: [['Jenis Cost','Actual Cost','Net Sales','Actual COGS (%)']],
-    body: rows.map(r=>[r.label, fmtIDR(r.actual), r.hasNs?fmtIDR(r.netSales):'Net Sales belum diisi', r.hasNs?(r.actual/r.netSales*100).toFixed(2).replace('.',',')+'%':'—']),
+    body: rows.map(r=>[r.label, r3ActualTxt(r), r.hasNs?fmtIDR(r.netSales):'Net Sales belum diisi', r3PctTxt(r)]),
     styles:{fontSize:9.5, cellPadding:6},
     headStyles:{fillColor:[107,63,34], textColor:255},
     // Fixed cellWidth per column -- sums to the page's usable width.
