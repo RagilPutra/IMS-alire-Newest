@@ -1641,6 +1641,7 @@ const state = {
   srTransactions: [],
   wipRequestTransactions: [],
   receivingTransactions: [],
+  typedTx: { transfer: [], usage: [], waste: [], adjustment: [] }, // listener sendiri per jenis (bukan jendela 500 transaksi terbaru) -- lihat komentar di initDb
   notifOpen: false,
   dashboardLocation: '',
   dashboardStockMode: 'value',
@@ -1648,7 +1649,7 @@ const state = {
   srTab: 'menunggu', srPage: 1, srPageSize: 50, srSearch: '', srDateFrom: '', srDateTo: '',
   wipTab: 'menunggu', wipPage: 1, wipPageSize: 50, wipSearch: '', wipDateFrom: '', wipDateTo: '',
   reportMasukLocation: '', reportMasukSupplier: '', reportMasukCategories: [], reportMasukPage: 1, reportMasukPageSize: 50, reportMasukSearch: '', reportMasukDateFrom: '', reportMasukDateTo: '',
-  reportKeluarLocation: '', reportKeluarPage: 1, reportKeluarPageSize: 50, reportKeluarSearch: '', reportKeluarDateFrom: '', reportKeluarDateTo: '',
+  reportKeluarRange: null, reportKeluarLocation: '', reportKeluarPage: 1, reportKeluarPageSize: 50, reportKeluarSearch: '', reportKeluarDateFrom: '', reportKeluarDateTo: '',
   reportWipPage: 1, reportWipPageSize: 50, reportWipSearch: '', reportWipDateFrom: '', reportWipDateTo: '',
   receivingSearch: '', receivingDateFrom: '', receivingDateTo: '', receivingPage: 1, receivingPageSize: 50,
   transfersSearch: '', transfersDateFrom: '', transfersDateTo: '', transfersPage: 1, transfersPageSize: 50,
@@ -2255,6 +2256,18 @@ async function initDb(){
     renderUnlessOpnameTyping();
     _markLoaded('receivingTransactions');
   }, err=>{ toast('Gagal memuat data Penerimaan Barang.', true); _markLoaded('receivingTransactions'); });
+
+  // Barang Bergerak (transfer), Barang Terpakai (usage), Waste, dan Penyesuaian (adjustment) juga
+  // SENGAJA punya listener sendiri per jenis, dengan alasan yang sama seperti SR/WIP/Penerimaan di
+  // atas: `state.transactions` hanya memuat 500 transaksi TERBARU dari semua jenis, dan satu kali
+  // Stok Opname / revisi bisa mencatat ratusan baris sekaligus sehingga transfer beberapa hari lalu
+  // terdorong keluar jendela itu dan hilang dari laporan (dokumennya tetap ada, hanya tidak termuat).
+  ['transfer','usage','waste','adjustment'].forEach(ty=>{
+    db.collection('transactions').where('type','==',ty).orderBy('createdAt','desc').limit(5000).onSnapshot(snap=>{
+      state.typedTx[ty] = snap.docs.map(d=>({id:d.id, ...d.data()}));
+      renderUnlessOpnameTyping();
+    }, err=>{ toast('Gagal memuat data transaksi ' + ty + '.', true); });
+  });
 
   db.collection('suppliers').onSnapshot(snap=>{
     state.suppliers = snap.docs.map(d=>({id:d.id, ...d.data()})).sort((a,b)=>(a.name||'').localeCompare(b.name||''));
@@ -3754,7 +3767,7 @@ function renderShell(){
 function notifPanelHtml(){
   const role = currentRole();
   const docs = {};
-  state.transactions.filter(t=>{
+  state.srTransactions.filter(t=>{
     if(t.type!=='request' || t.status!=='menunggu') return false;
     if(role.kind==='master') return true; // Master can act at both stages (Kitchen Leader gate + Receiving)
     if(canApproveKitchenGate(role)) return isKitchenGatePending(t) && role.divisionIds && role.divisionIds.includes(t.divisionId);
@@ -6488,7 +6501,7 @@ function mixUseReviewRows(mode){
 // dropdown, which Master still has to actively pick.
 function mixUseRequestHint(itemId){
   const counts = {};
-  state.transactions.forEach(t=>{
+  state.srTransactions.forEach(t=>{
     if(t.type==='request' && t.itemId===itemId && t.divisionId) counts[t.divisionId] = (counts[t.divisionId]||0) + 1;
   });
   const entries = Object.entries(counts).sort((a,b)=>b[1]-a[1]);
@@ -7519,7 +7532,7 @@ async function submitReceivingAttachment(docNumber, inputEl){
 }
 
 function openTransferDetail(docNumber){
-  const lines = state.transactions.filter(t=>t.type==='transfer' && t.docNumber===docNumber);
+  const lines = state.typedTx.transfer.filter(t=>t.type==='transfer' && t.docNumber===docNumber);
   if(lines.length===0) return;
   const first = lines[0];
   const total = lines.reduce((s,l)=>s+(l.totalValue||0),0);
@@ -7812,7 +7825,7 @@ function setTransfersPage(p){ state.transfersPage = p; render(); }
 function renderTransfers(){
   const role = currentRole();
   const canT = canManageGudang(role);
-  let docs = groupByDocNumber(state.transactions.filter(t=>t.type==='transfer'));
+  let docs = groupByDocNumber(state.typedTx.transfer.filter(t=>t.type==='transfer'));
   if(state.transfersSearch){
     const q = state.transfersSearch.toLowerCase();
     docs = docs.filter(d => d.docNumber.toLowerCase().includes(q) || d.lines.some(l=>(l.itemName||'').toLowerCase().includes(q)) || (d.lines[0].fromWarehouseName||'').toLowerCase().includes(q) || (d.lines[0].toWarehouseName||'').toLowerCase().includes(q) || (d.lines[0].requestDocNumber||'').toLowerCase().includes(q));
@@ -7857,7 +7870,7 @@ function renderTransfers(){
 function renderUsage(){
   const role = currentRole();
   const canU = canUsage(role);
-  const list = state.transactions.filter(t=>t.type==='usage');
+  const list = state.typedTx.usage.filter(t=>t.type==='usage');
   document.getElementById('content').innerHTML = `
     <div class="action-row">${canU ? `<button class="btn btn-primary" onclick="openUsageModal()">${ICONS.plus} Record Usage</button>` : ''}</div>
     <div class="panel">
@@ -7881,7 +7894,7 @@ function renderUsage(){
 function renderWaste(){
   const role = currentRole();
   const canW = canUsage(role);
-  const list = state.transactions.filter(t=>t.type==='waste');
+  const list = state.typedTx.waste.filter(t=>t.type==='waste');
   document.getElementById('content').innerHTML = `
     <div class="action-row">${canW ? `<button class="btn btn-primary" onclick="openWasteModal()">${ICONS.plus} Record Waste</button>` : ''}</div>
     <div class="panel">
@@ -7947,7 +7960,7 @@ async function submitWaste(){
 function renderAdjustments(){
   const role = currentRole();
   const canA = canManageGudang(role) || role.kind==='master';
-  const list = state.transactions.filter(t=>t.type==='adjustment');
+  const list = state.typedTx.adjustment.filter(t=>t.type==='adjustment');
   document.getElementById('content').innerHTML = `
     <div class="action-row">${canA ? `<button class="btn btn-primary" onclick="openAdjustmentModal()">${ICONS.plus} New Adjustment</button>` : `<div class="lock-note" style="margin:0;">Only Receiving and Master User can post adjustments.</div>`}</div>
     <div class="panel">
@@ -10438,8 +10451,43 @@ function setReportKeluarSearch(v){ state.reportKeluarSearch = v; state.reportKel
 function setReportKeluarDateFrom(v){ state.reportKeluarDateFrom = v; state.reportKeluarPage=1; render(); }
 function setReportKeluarDateTo(v){ state.reportKeluarDateTo = v; state.reportKeluarPage=1; render(); }
 function resetReportKeluarFilters(){ state.reportKeluarSearch=''; state.reportKeluarDateFrom=''; state.reportKeluarDateTo=''; state.reportKeluarLocation=''; state.reportKeluarPage=1; render(); }
+/* Barang Bergerak: tanpa filter tanggal memakai daftar transfer terbaru (typedTx, maks 5.000 baris).
+   Begitu rentang tanggal dipilih, data ditarik LANGSUNG dari database untuk rentang itu (tanpa
+   bergantung pada usia datanya), di-cache per rentang dan dimuat ulang paling cepat tiap 30 detik. */
+const REPORT_KELUAR_RANGE_CAP = 20000;
+function reportKeluarRangeKey(){ return (state.reportKeluarDateFrom||'') + '|' + (state.reportKeluarDateTo||''); }
+async function loadReportKeluarRange(){
+  const key = reportKeluarRangeKey();
+  const cur = state.reportKeluarRange;
+  if(cur && cur.loading) return;
+  state.reportKeluarRange = { key, lines: (cur && cur.key===key) ? cur.lines : null, loading: true, at: cur && cur.key===key ? cur.at : 0, truncated: false };
+  try{
+    let q = db.collection('transactions').where('type','==','transfer');
+    if(state.reportKeluarDateFrom){ const f = new Date(state.reportKeluarDateFrom); f.setHours(0,0,0,0); q = q.where('createdAt','>=', f.toISOString()); }
+    if(state.reportKeluarDateTo){ const t = new Date(state.reportKeluarDateTo); t.setHours(23,59,59,999); q = q.where('createdAt','<=', t.toISOString()); }
+    const snap = await q.limit(REPORT_KELUAR_RANGE_CAP).get();
+    const lines = ((snap && snap.docs) || []).map(d=>({id:d.id, ...d.data()}));
+    if(reportKeluarRangeKey() === key){
+      state.reportKeluarRange = { key, lines, loading:false, at: Date.now(), truncated: lines.length >= REPORT_KELUAR_RANGE_CAP };
+    } else { state.reportKeluarRange = null; }
+  }catch(e){
+    state.reportKeluarRange = { key, lines: (cur && cur.key===key) ? cur.lines : [], loading:false, at: Date.now(), error:true, truncated:false };
+    toast('Gagal memuat data transfer untuk rentang tanggal ini.', true);
+  }
+  if(state.view==='report-keluar') render();
+}
+function reportKeluarBase(){
+  const hasRange = !!(state.reportKeluarDateFrom || state.reportKeluarDateTo);
+  if(!hasRange) return { lines: state.typedTx.transfer.filter(t=>t.type==='transfer'), loading:false, truncated: state.typedTx.transfer.length >= 5000, ranged:false };
+  const r = state.reportKeluarRange;
+  const fresh = r && r.key===reportKeluarRangeKey() && !r.loading && (Date.now() - r.at) < 30000;
+  if(!fresh && !(r && r.loading)) setTimeout(loadReportKeluarRange, 0);
+  const ready = r && r.key===reportKeluarRangeKey() && r.lines;
+  return { lines: ready ? r.lines.filter(t=>t.type==='transfer') : [], loading: !ready, truncated: !!(ready && r.truncated), ranged:true };
+}
 function renderReportKeluar(){
-  let lines = state.transactions.filter(t=>t.type==='transfer');
+  const base = reportKeluarBase();
+  let lines = base.lines;
   if(state.reportKeluarLocation) lines = lines.filter(l=>l.fromWarehouseId===state.reportKeluarLocation || l.toWarehouseId===state.reportKeluarLocation);
   if(state.reportKeluarSearch){
     const q = state.reportKeluarSearch.toLowerCase();
@@ -10463,11 +10511,12 @@ function renderReportKeluar(){
       <div class="filter-row">
         ${searchDateFilterHtml({placeholder:'Cari No. Transfer, No. SR, atau barang…', search:state.reportKeluarSearch, dateFrom:state.reportKeluarDateFrom, dateTo:state.reportKeluarDateTo, onSearch:'setReportKeluarSearch', onDateFrom:'setReportKeluarDateFrom', onDateTo:'setReportKeluarDateTo', onReset:'resetReportKeluarFilters', extraActive: !!state.reportKeluarLocation})}
       </div>
+      ${base.truncated ? `<div class="lock-note" style="margin:8px 16px;">${base.ranged ? 'Rentang tanggal ini berisi lebih dari ' + REPORT_KELUAR_RANGE_CAP.toLocaleString('id-ID') + ' baris — hanya sebagian yang tampil. Persempit rentang tanggalnya.' : 'Menampilkan 5.000 baris transfer terbaru. Pilih rentang tanggal untuk melihat data yang lebih lama.'}</div>` : ''}
       <div class="table-scroll">
         <table>
           <thead><tr><th>Tanggal</th><th>No. Transfer</th><th>No. SR</th><th>Dari</th><th>Ke</th><th>Barang</th><th class="num">Jumlah</th><th class="num">Nilai</th></tr></thead>
           <tbody>
-            ${pageLines.length===0 ? `<tr class="empty-row"><td colspan="8">Tidak ada barang bergerak yang cocok.</td></tr>` :
+            ${pageLines.length===0 ? `<tr class="empty-row"><td colspan="8">${base.loading ? 'Memuat data transfer untuk rentang tanggal ini…' : 'Tidak ada barang bergerak yang cocok.'}</td></tr>` :
               pageLines.map(l=>`<tr><td>${fmtDate(l.createdAt)}</td><td class="code-mono">${l.docNumber||'—'}</td><td class="code-mono">${l.requestDocNumber||'—'}</td><td>${escapeHtml(l.fromWarehouseName)}</td><td class="cell-title">${escapeHtml(l.toWarehouseName)}</td><td>${escapeHtml(l.itemName)}</td><td class="num">${qtyWithSmallNote(l.qty, itemById(l.itemId), l.uom)}</td><td class="num">${fmtIDR(l.totalValue||0)}</td></tr>`).join('')}
           </tbody>
         </table>
@@ -10477,7 +10526,7 @@ function renderReportKeluar(){
   `;
 }
 function reportKeluarFilteredLines(){
-  let lines = state.transactions.filter(t=>t.type==='transfer');
+  let lines = reportKeluarBase().lines;
   if(state.reportKeluarLocation) lines = lines.filter(l=>l.fromWarehouseId===state.reportKeluarLocation || l.toWarehouseId===state.reportKeluarLocation);
   if(state.reportKeluarSearch){
     const q = state.reportKeluarSearch.toLowerCase();
