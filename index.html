@@ -2536,31 +2536,113 @@ async function nextDocNumber(prefix){
 }
 
 /* --- Penerimaan Barang (multi-item document) --- */
+/* Menyimpan Penerimaan Barang dengan banyak baris (30+):
+   - Sebelumnya semua baris diproses satu per satu (stok -> harga -> catatan, belasan permintaan jaringan
+     per baris), jadi dokumen besar lama dan kalau satu permintaan gagal di tengah, sebagian baris
+     sudah masuk dan sisanya tidak ("hanya seberapa yang masuk"); menyimpan ulang lalu menggandakan
+     yang sudah masuk.
+   - Sekarang: stok digabung per lokasi+barang, diproses paralel (maks 5 sekaligus), tiap langkah dicoba
+     ulang kalau jaringan putus (dengan cek apakah perubahan sebelumnya ternyata sudah masuk, supaya
+     tidak terhitung dua kali), progres tampil di layar, dan kalau tetap gagal SELURUH dokumen
+     dibatalkan (stok dikembalikan, catatan dihapus) sehingga aman disimpan ulang tanpa duplikat. */
+const GR_CONCURRENCY = 5;
+function _sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+async function runLimited(tasks, limit, onDone){
+  let next = 0, done = 0, failed = null;
+  async function worker(){
+    while(!failed){
+      const i = next++;
+      if(i >= tasks.length) return;
+      try{ await tasks[i](); done++; if(onDone) onDone(done, tasks.length); }
+      catch(e){ failed = failed || e; return; }
+    }
+  }
+  await Promise.all(Array.from({length: Math.min(limit, tasks.length)}, worker));
+  if(failed) throw failed;
+}
+// Penambahan stok yang tahan putus jaringan: kalau gagal, cek dulu apakah perubahan ternyata sudah masuk
+// (hasil tulis tiba tapi balasannya hilang) sebelum mencoba lagi, agar tidak bertambah dua kali.
+async function adjustStockVerified(warehouseId, itemId, delta, peruntukan){
+  const ref = db.doc('stock/' + stockDocId(warehouseId, itemId, peruntukan));
+  const read = async ()=>{ const sn = await ref.get(); return (sn && sn.exists) ? (sn.data().qty||0) : 0; };
+  const before = await read();
+  let lastErr = null;
+  for(let attempt=0; attempt<3; attempt++){
+    try{ await adjustStock(warehouseId, itemId, delta, peruntukan, {allowNegative:true}); return; }
+    catch(e){
+      lastErr = e;
+      await _sleep(500 * (attempt+1));
+      let now = null;
+      try{ now = await read(); }catch(_){ now = null; }
+      if(now!==null){
+        if(Math.abs(now - (before + delta)) < 0.0005) return;          // ternyata sudah masuk
+        if(Math.abs(now - before) >= 0.0005) throw lastErr;            // stok diubah pihak lain: jangan menebak
+      }
+    }
+  }
+  throw lastErr;
+}
 async function actionReceivingDoc(payload){
   const docNumber = await nextDocNumber('GR');
-  // Every line of one GR shares the exact same createdAt (set once for the
-  // whole document, see payload.createdAt above/below) and Firestore's
-  // orderBy('createdAt') breaks ties by document id -- which is essentially
-  // random, not insertion order. lineIndex records the position the user
-  // actually entered each line in (matching their invoice/surat jalan), so
-  // every place that displays or exports these lines can sort on it instead
-  // of silently inheriting Firestore's tie-break order.
+  const progress = (txt)=>{ const el = document.getElementById('loadingText'); if(el) el.textContent = txt; };
+  progress('Menyiapkan ' + payload.lines.length + ' barang…');
+  // lineIndex = urutan baris yang diinput user (sesuai nota/surat jalan) -- dipakai semua tampilan & ekspor
+  // untuk mengurutkan, karena semua baris satu dokumen punya createdAt yang sama.
+  const prepared = [];
   for(let idx=0; idx<payload.lines.length; idx++){
     const line = payload.lines[idx];
     const item = await getOrCreateItem({name: line.itemName, category: line.category, uom: line.uom});
     const peruntukan = isStorageWarehouse(line.locationId) ? (line.peruntukan || 'mix') : null;
-    await adjustStock(line.locationId, item.id, line.qty, peruntukan);
-    if(line.price>0) await setItemLastPrice(item.id, line.price);
-    await logTx({
-      type:'in', status:'completed', docNumber, lineIndex: idx,
-      itemId:item.id, itemName:item.name, uom:item.uom, qty:line.qty,
-      price:line.price||0, totalValue:(line.price||0)*line.qty,
-      toWarehouseId:line.locationId, toWarehouseName:whName(line.locationId),
-      peruntukan: peruntukan,
-      supplierId: payload.supplierId||'', supplierName: payload.supplierName||'', note: payload.note||'',
-      doNumber: payload.doNumber||'', ppn: payload.ppn||0, shippingCost: payload.shippingCost||0, attachmentId: payload.attachmentId||null,
-      createdAt: payload.createdAt || null,
-    });
+    prepared.push({ idx, line, item, peruntukan });
+  }
+  // Gabungkan baris yang menuju stok yang sama (lokasi + barang + peruntukan) menjadi satu penyesuaian.
+  const stockMap = new Map();
+  prepared.forEach(pr=>{
+    const key = stockDocId(pr.line.locationId, pr.item.id, pr.peruntukan);
+    const cur = stockMap.get(key) || { warehouseId: pr.line.locationId, itemId: pr.item.id, peruntukan: pr.peruntukan, delta: 0 };
+    cur.delta += pr.line.qty;
+    stockMap.set(key, cur);
+  });
+  const stockJobs = [...stockMap.values()];
+  const appliedStock = [];   // penyesuaian stok yang sudah berhasil (untuk pembatalan)
+  const loggedTxIds = [];    // catatan transaksi yang sudah tersimpan (untuk pembatalan)
+  const total = stockJobs.length + prepared.length;
+  let finished = 0;
+  const tick = ()=>{ finished++; progress('Menyimpan penerimaan… ' + finished + '/' + total); };
+  progress('Menyimpan penerimaan… 0/' + total);
+  try{
+    await runLimited(stockJobs.map(j=>async()=>{
+      await adjustStockVerified(j.warehouseId, j.itemId, j.delta, j.peruntukan);
+      appliedStock.push(j); tick();
+    }), GR_CONCURRENCY);
+    await runLimited(prepared.map(pr=>async()=>{
+      const line = pr.line, item = pr.item;
+      const ref = await db.collection('transactions').add({
+        type:'in', status:'completed', docNumber, lineIndex: pr.idx,
+        itemId:item.id, itemName:item.name, uom:item.uom, qty:line.qty,
+        price:line.price||0, totalValue:(line.price||0)*line.qty,
+        toWarehouseId:line.locationId, toWarehouseName:whName(line.locationId),
+        peruntukan: pr.peruntukan,
+        supplierId: payload.supplierId||'', supplierName: payload.supplierName||'', note: payload.note||'',
+        doNumber: payload.doNumber||'', ppn: payload.ppn||0, shippingCost: payload.shippingCost||0, attachmentId: payload.attachmentId||null,
+        role: state.role, roleName: currentRole().name, createdBy: currentUserName || null,
+        createdAt: payload.createdAt || new Date().toISOString(),
+      });
+      loggedTxIds.push(ref.id); tick();
+    }), GR_CONCURRENCY);
+    // Harga terakhir per barang: baris TERAKHIR (urutan input) yang berharga menang, sama seperti sebelumnya.
+    const lastPrice = new Map();
+    prepared.forEach(pr=>{ if(pr.line.price>0) lastPrice.set(pr.item.id, pr.line.price); });
+    await runLimited([...lastPrice.entries()].map(([itemId, price])=>()=>setItemLastPrice(itemId, price)), GR_CONCURRENCY);
+  }catch(err){
+    progress('Gagal — membatalkan penerimaan…');
+    let cleanFailed = 0;
+    for(const id of loggedTxIds){ try{ await db.doc('transactions/' + id).delete(); }catch(e){ cleanFailed++; } }
+    for(const j of appliedStock){ try{ await adjustStock(j.warehouseId, j.itemId, -j.delta, j.peruntukan, {allowNegative:true}); }catch(e){ cleanFailed++; } }
+    if(cleanFailed === 0){
+      throw new Error('Penerimaan GAGAL disimpan dan sudah dibatalkan seluruhnya — tidak ada stok atau catatan yang tertinggal. Silakan tekan Simpan lagi. (' + (err && err.message ? err.message : 'koneksi bermasalah') + ')');
+    }
+    throw new Error('Penerimaan gagal di tengah jalan dan pembatalan otomatis tidak sepenuhnya berhasil (' + cleanFailed + ' langkah). JANGAN simpan ulang dulu: cek Penerimaan Barang dan stok untuk dokumen ' + docNumber + ' lalu hubungi Master. (' + (err && err.message ? err.message : '') + ')');
   }
   toast('Penerimaan ' + docNumber + ' disimpan (' + payload.lines.length + ' barang).');
   return docNumber;
