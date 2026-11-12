@@ -1234,7 +1234,22 @@ th.sortable.sorted .sort-ind{opacity:1; color:var(--brand);}
   const APP_KEY = "__APP_KEY__";
   const SNAPSHOT_POLL_MS = 4000;
 
+  // Beberapa listener (transaksi 'in', transfer, usage, dst.) membaca KOLEKSI YANG SAMA setiap 4 detik.
+  // Tanpa berbagi, tiap listener mengunduh seluruh koleksi sendiri-sendiri (transaksi = ribuan baris, beberapa MB).
+  // Di sini semua listener yang jalan berdekatan memakai satu unduhan yang sama; cache dibuang tiap ada tulis.
+  const _listCache = new Map();
+  const LIST_SHARE_MS = 3000;
+  function sharedList(col) {
+    const hit = _listCache.get(col);
+    if (hit && Date.now() - hit.t < LIST_SHARE_MS) return hit.p;
+    const p = api('GET', '/api/collections/' + encodeURIComponent(col));
+    const entry = { t: Date.now(), p };
+    _listCache.set(col, entry);
+    p.catch(() => { if (_listCache.get(col) === entry) _listCache.delete(col); });
+    return p;
+  }
   async function api(method, url, body, isFormData) {
+    if (method !== 'GET') _listCache.clear();
     const headers = {};
     if (APP_KEY) headers['X-App-Key'] = APP_KEY;
     let payload = body;
@@ -1298,8 +1313,8 @@ th.sortable.sorted .sort-ind{opacity:1; color:var(--brand);}
     limit(n) {
       return new CollectionRef(this._col, this._wheres, this._order, n);
     }
-    async _fetchRows() {
-      const rows = await api('GET', '/api/collections/' + encodeURIComponent(this._col));
+    async _fetchRows(shared) {
+      const rows = shared ? await sharedList(this._col) : await api('GET', '/api/collections/' + encodeURIComponent(this._col));
       let filtered = this._wheres.length ? rows.filter(r => applyWhere(r.data, this._wheres)) : rows.slice();
       if (this._order) {
         const { field, direction } = this._order;
@@ -1325,8 +1340,9 @@ th.sortable.sorted .sort-ind{opacity:1; color:var(--brand);}
       let stopped = false;
       const tick = async () => {
         if (stopped) return;
+        if (window.__pausePolling > 0) return;   // jeda selama penyimpanan besar (mis. Penerimaan Barang)
         try {
-          const rows = await this._fetchRows();
+          const rows = await this._fetchRows(true);
           if (!stopped) onNext(makeSnapshot(rows));
         } catch (e) {
           if (!stopped && onError) onError(e);
@@ -1363,6 +1379,7 @@ th.sortable.sorted .sort-ind{opacity:1; color:var(--brand);}
       let stopped = false;
       const tick = async () => {
         if (stopped) return;
+        if (window.__pausePolling > 0) return;
         try {
           const snap = await this.get();
           if (!stopped) onNext(snap);
@@ -2582,7 +2599,14 @@ async function adjustStockVerified(warehouseId, itemId, delta, peruntukan){
   }
   throw lastErr;
 }
+/* Selama penerimaan disimpan, polling latar belakang (khusus versi Railway) dijeda supaya tidak berebut
+   bandwidth/server dengan puluhan permintaan tulis. Di versi Artifact penghitung ini tidak dipakai siapa pun. */
 async function actionReceivingDoc(payload){
+  window.__pausePolling = (window.__pausePolling||0) + 1;
+  try{ return await actionReceivingDocImpl(payload); }
+  finally{ window.__pausePolling = Math.max(0, (window.__pausePolling||1) - 1); }
+}
+async function actionReceivingDocImpl(payload){
   const docNumber = await nextDocNumber('GR');
   const progress = (txt)=>{ const el = document.getElementById('loadingText'); if(el) el.textContent = txt; };
   progress('Menyiapkan ' + payload.lines.length + ' barang…');
